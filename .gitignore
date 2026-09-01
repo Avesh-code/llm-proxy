@@ -1,0 +1,19 @@
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+
+# Runtime state: backends/teams/tracing config (incl. every backend API key
+# and team token), persisted by the admin UI. Lives outside the image via
+# the proxy-data volume in docker-compose.yml.
+data/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS / editor cruft
+.DS_Store
+*.swp

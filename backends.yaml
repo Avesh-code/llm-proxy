@@ -1,0 +1,75 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# LLM proxy topology — ONE-TIME MIGRATION SEED, read only on the very first
+# boot (when data/config.json doesn't exist yet) to import a starting set of
+# backends and teams. After that, backends/teams/tracing are all managed live
+# at /admin and persisted to data/config.json — this file is then ignored.
+# To re-seed from scratch: delete data/config.json and restart.
+#
+# Safe to commit: no secrets live here. Each secret (backend API key, team
+# bearer token) is a *name* pointing at a variable in .env.
+#
+# Add a backend:
+#   <name>:
+#     base_url: http://host:port          # no trailing slash needed
+#     api_key_env: SOME_VAR                # omit if the backend needs no auth
+#     models: [model-id, ...]              # shown in /whoami and /v1/models
+#
+# Add a team:
+#   <team-name>:
+#     token_env: SOME_VAR                  # the bearer token developers use
+#     backends: [backend-name, ...]        # which of the above it may call
+#
+# Requests are routed by URL path: POST /<backend>/v1/chat/completions
+# forwards to that backend's base_url + /v1/chat/completions. A team with
+# more than one backend picks between them by which path they hit — nothing
+# is inferred from the `model` field, since real model ids (e.g.
+# "meta-llama/Llama-3-70b") can themselves contain a "/".
+# ─────────────────────────────────────────────────────────────────────────────
+
+backends:
+  # No backends pre-added — add them all at /admin instead.
+  #
+  # Example OpenAI backend — uncomment to seed it on next first-boot instead.
+  # openai:
+  #   base_url: https://api.openai.com
+  #   api_key_env: OPENAI_API_KEY
+  #   models:
+  #     - gpt-4o
+  #     - gpt-4o-mini
+  #     - gpt-4.1
+
+  # Example vLLM backend — uncomment and point at your server.
+  # vLLM speaks the OpenAI API, so paths under it look identical to openai's.
+  # vllm-prod:
+  #   base_url: http://vllm.internal:8000
+  #   api_key_env: VLLM_PROD_API_KEY   # remove this line if the server has no --api-key set
+  #   models:
+  #     - meta-llama/Llama-3.1-70B-Instruct
+
+  # Example Ollama backend — uncomment and point at your server.
+  # Ollama's OpenAI-compatible routes live under /v1/... same as above;
+  # its native routes (/api/chat, /api/tags, ...) are proxied too, just
+  # without Langfuse tracing (see LLM_ENDPOINTS in proxy.py).
+  # ollama-local:
+  #   base_url: http://ollama.internal:11434
+  #   models:
+  #     - llama3
+  #     - codellama
+  #     - mistral
+
+teams:
+  # No teams pre-added — add them all at /admin instead.
+  #
+  # Example teams — uncomment to seed them on next first-boot instead.
+  # team-platform:
+  #   token_env: TOKEN_TEAM_PLATFORM
+  #   backends: [openai]
+  #
+  # team-search:
+  #   token_env: TOKEN_TEAM_SEARCH
+  #   backends: [openai]
+  #
+  # Example of a team with access to more than one backend.
+  # team-ml:
+  #   token_env: TOKEN_TEAM_ML
+  #   backends: [openai, vllm-prod, ollama-local]

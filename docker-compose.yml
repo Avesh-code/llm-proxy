@@ -1,0 +1,54 @@
+services:
+  langfuse-proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: langfuse-ai-proxy:latest
+    container_name: langfuse-proxy
+    restart: unless-stopped
+
+    # Bound to localhost. Change to "${PROXY_PORT:-4000}:4000" to expose it on
+    # the LAN — only once every team has a real token (managed at /admin), or
+    # anyone who can reach this port spends your backend budget.
+    ports:
+      - "127.0.0.1:${PROXY_PORT:-4000}:4000"
+
+    env_file:
+      - .env
+
+    environment:
+      # Re-declared so `docker compose config` shows what is actually in play.
+      # Backends/teams/tracing themselves live in data/config.json, managed
+      # from /admin — LANGFUSE_* here is only a one-time seed for it on the
+      # very first boot.
+      ADMIN_TOKEN:         ${ADMIN_TOKEN:?set ADMIN_TOKEN in .env — this guards the /admin UI}
+      PUBLIC_BASE_URL:     ${PUBLIC_BASE_URL:-}
+      LANGFUSE_HOST:       ${LANGFUSE_HOST:-}
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      CONFIG_PATH:         ${CONFIG_PATH:-backends.yaml}
+      PROXY_PORT:          4000
+      PROXY_TIMEOUT:       ${PROXY_TIMEOUT:-600}
+
+    # Persists data/config.json (backends, teams, tracing settings saved via
+    # the admin UI) across `docker compose up -d --force-recreate` / image
+    # rebuilds. Without this, admin edits would vanish on every recreate.
+    volumes:
+      - proxy-data:/app/data
+
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:4000/health')"]
+      interval: 30s
+      timeout:  10s
+      retries:  3
+      start_period: 10s
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  proxy-data:

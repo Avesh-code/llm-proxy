@@ -1,0 +1,819 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LLM Proxy — Admin</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f5f6f8;
+    --bg-soft: #eceef2;
+    --panel: #ffffff;
+    --panel-2: #fbfbfd;
+    --border: #e3e5eb;
+    --border-soft: #edeef2;
+    --text: #1a1d24;
+    --muted: #6b7280;
+    --muted-2: #9aa1ac;
+    --accent: #4f6bfa;
+    --accent-hover: #3d57e8;
+    --accent-soft: #eef1ff;
+    --accent-text: #ffffff;
+    --danger: #e0405a;
+    --danger-soft: #fdecef;
+    --ok: #1a9c62;
+    --ok-soft: #e8f8f0;
+    --warn: #b7791f;
+    --warn-soft: #fbf3e2;
+    --input-bg: #ffffff;
+    --shadow: 0 1px 2px rgba(20,22,30,.04), 0 8px 24px -12px rgba(20,22,30,.10);
+    --shadow-lg: 0 12px 40px -12px rgba(20,22,30,.22);
+    --radius: 12px;
+    --radius-sm: 8px;
+    --ring: 0 0 0 3px var(--accent-soft);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, Helvetica, Arial, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0d0f14; --bg-soft: #12151c; --panel: #171a22; --panel-2: #1c1f29;
+      --border: #262a35; --border-soft: #20232c; --text: #e8eaf0; --muted: #9198a8;
+      --muted-2: #6b7182; --accent: #6b87ff; --accent-hover: #8199ff; --accent-soft: #1c2340;
+      --accent-text: #0b0d12; --danger: #ff6b81; --danger-soft: #2a1620; --ok: #3ddc97;
+      --ok-soft: #12291f; --warn: #f2c14e; --warn-soft: #2b2311; --input-bg: #12151c;
+      --shadow: 0 1px 2px rgba(0,0,0,.3), 0 8px 24px -12px rgba(0,0,0,.5);
+      --shadow-lg: 0 20px 60px -16px rgba(0,0,0,.6); --ring: 0 0 0 3px rgba(107,135,255,.25);
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0d0f14; --bg-soft: #12151c; --panel: #171a22; --panel-2: #1c1f29;
+    --border: #262a35; --border-soft: #20232c; --text: #e8eaf0; --muted: #9198a8;
+    --muted-2: #6b7182; --accent: #6b87ff; --accent-hover: #8199ff; --accent-soft: #1c2340;
+    --accent-text: #0b0d12; --danger: #ff6b81; --danger-soft: #2a1620; --ok: #3ddc97;
+    --ok-soft: #12291f; --warn: #f2c14e; --warn-soft: #2b2311; --input-bg: #12151c;
+    --shadow: 0 1px 2px rgba(0,0,0,.3), 0 8px 24px -12px rgba(0,0,0,.5);
+    --shadow-lg: 0 20px 60px -16px rgba(0,0,0,.6); --ring: 0 0 0 3px rgba(107,135,255,.25);
+  }
+
+  * { box-sizing: border-box; }
+  html { color-scheme: light dark; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    min-height: 100vh; -webkit-font-smoothing: antialiased;
+    transition: background .2s ease, color .2s ease;
+  }
+  svg.icon { width: 16px; height: 16px; stroke: currentColor; fill: none; stroke-width: 1.8;
+    stroke-linecap: round; stroke-linejoin: round; flex: none; vertical-align: -3px; }
+
+  /* ── Header ─────────────────────────────────────────────────────────── */
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 14px 28px; border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; background: color-mix(in srgb, var(--bg) 88%, transparent);
+    backdrop-filter: blur(10px); z-index: 20;
+  }
+  .brand { display: flex; align-items: center; gap: 10px; }
+  .brand-mark {
+    width: 30px; height: 30px; border-radius: 9px; display: flex; align-items: center; justify-content: center;
+    background: linear-gradient(150deg, var(--accent), #9b7bff); color: #fff; flex: none;
+    box-shadow: 0 2px 8px -2px rgba(79,107,250,.6);
+  }
+  .brand-mark svg { width: 17px; height: 17px; stroke: #fff; }
+  .brand-text h1 { font-size: 14.5px; margin: 0; font-weight: 650; letter-spacing: -.01em; line-height: 1.2; }
+  .brand-text p { margin: 1px 0 0; font-size: 11.5px; color: var(--muted); }
+  header .right { display: flex; align-items: center; gap: 8px; }
+  .icon-btn {
+    width: 32px; height: 32px; display: flex; align-items: center; justify-content: center;
+    border-radius: 8px; border: 1px solid var(--border); background: var(--panel); color: var(--muted);
+    cursor: pointer; transition: all .15s ease;
+  }
+  .icon-btn:hover { color: var(--text); border-color: var(--muted-2); }
+
+  main { max-width: 1040px; margin: 0 auto; padding: 28px 24px 60px; }
+  .locked main, .locked header { filter: blur(6px) saturate(0); pointer-events: none; user-select: none; }
+
+  /* ── Token gate ─────────────────────────────────────────────────────── */
+  .token-gate {
+    display: none; max-width: 400px; margin: 13vh auto; padding: 30px 28px;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 16px; box-shadow: var(--shadow-lg);
+  }
+  .locked .token-gate { display: block; animation: rise .35s ease; }
+  .locked .app { display: none; }
+  .token-gate .gate-mark {
+    width: 44px; height: 44px; border-radius: 12px; display: flex; align-items: center; justify-content: center;
+    background: linear-gradient(150deg, var(--accent), #9b7bff); margin-bottom: 16px;
+    box-shadow: 0 4px 16px -4px rgba(79,107,250,.55);
+  }
+  .token-gate .gate-mark svg { width: 22px; height: 22px; stroke: #fff; }
+  .token-gate h2 { margin: 0 0 6px; font-size: 18px; font-weight: 650; letter-spacing: -.01em; }
+  .token-gate p { color: var(--muted); font-size: 13px; line-height: 1.5; margin: 0 0 18px; }
+  .token-gate code { background: var(--bg-soft); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+  @keyframes rise { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+
+  /* ── Tabs ───────────────────────────────────────────────────────────── */
+  .tabs { display: flex; gap: 2px; background: var(--bg-soft); padding: 3px; border-radius: 10px;
+    margin-bottom: 24px; width: fit-content; border: 1px solid var(--border-soft); }
+  .tab {
+    display: flex; align-items: center; gap: 7px; padding: 7px 14px; cursor: pointer; color: var(--muted);
+    font-size: 13px; font-weight: 550; border-radius: 8px; user-select: none; transition: all .15s ease;
+  }
+  .tab:hover { color: var(--text); }
+  .tab.active { color: var(--text); background: var(--panel); box-shadow: var(--shadow); }
+  .tab .count { font-size: 11px; color: var(--muted-2); font-weight: 600; }
+  .tab.active .count { color: var(--accent); }
+  .panel { display: none; animation: fadein .25s ease; }
+  .panel.active { display: block; }
+  @keyframes fadein { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+
+  /* ── Cards ──────────────────────────────────────────────────────────── */
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 20px; margin-bottom: 18px; box-shadow: var(--shadow);
+  }
+  .card h2 { font-size: 14px; margin: 0; font-weight: 650; letter-spacing: -.005em;
+    display: flex; align-items: center; gap: 8px; }
+  .card h2 svg { color: var(--muted); }
+  .card .sub { color: var(--muted); font-weight: 450; font-size: 12px; }
+  .card-desc { color: var(--muted); font-size: 12.5px; line-height: 1.55; margin: 4px 0 14px; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--border-soft); vertical-align: top; }
+  th { color: var(--muted-2); font-weight: 600; font-size: 10.5px; text-transform: uppercase; letter-spacing: .06em; }
+  tbody tr { transition: background .12s ease; }
+  tbody tr:hover { background: var(--bg-soft); }
+  tr:last-child td { border-bottom: none; }
+  td.actions { white-space: nowrap; text-align: right; }
+  td.name-cell { font-weight: 600; }
+
+  .type-badge {
+    display: inline-flex; align-items: center; gap: 5px; padding: 3px 9px 3px 7px; border-radius: 999px;
+    font-size: 11.5px; font-weight: 600; border: 1px solid transparent;
+  }
+  .type-badge .dot { width: 6px; height: 6px; border-radius: 50%; flex: none; }
+  .type-openai { background: var(--ok-soft); color: var(--ok); }
+  .type-openai .dot { background: var(--ok); }
+  .type-vllm { background: var(--accent-soft); color: var(--accent); }
+  .type-vllm .dot { background: var(--accent); }
+  .type-ollama { background: var(--warn-soft); color: var(--warn); }
+  .type-ollama .dot { background: var(--warn); }
+  .type-openai-compatible { background: var(--bg-soft); color: var(--muted); }
+  .type-openai-compatible .dot { background: var(--muted-2); }
+
+  .chip {
+    display: inline-flex; align-items: center; background: var(--bg-soft); border: 1px solid var(--border);
+    border-radius: 999px; padding: 2px 9px; font-size: 11.5px; margin: 1px 3px 1px 0; color: var(--muted);
+  }
+  .chip.tracing-on { background: var(--ok-soft); color: var(--ok); border-color: transparent; font-weight: 600; }
+  .chip.tracing-off { background: var(--bg-soft); color: var(--muted-2); border-color: transparent; }
+  .mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; }
+
+  .empty { text-align: center; padding: 40px 20px; color: var(--muted); }
+  .empty svg { width: 34px; height: 34px; color: var(--muted-2); margin-bottom: 10px; }
+  .empty p { margin: 0 0 14px; font-size: 13px; }
+
+  /* ── Forms ──────────────────────────────────────────────────────────── */
+  label { display: block; font-size: 12px; font-weight: 550; color: var(--muted); margin: 14px 0 5px; }
+  label:first-of-type { margin-top: 0; }
+  .field-hint { font-size: 11.5px; color: var(--muted-2); font-weight: 400; margin-left: 4px; }
+  input[type=text], input[type=password], input[type=url], select, textarea {
+    width: 100%; background: var(--input-bg); border: 1px solid var(--border); color: var(--text);
+    padding: 8px 11px; border-radius: var(--radius-sm); font-size: 13px; font-family: inherit;
+    transition: border-color .15s ease, box-shadow .15s ease;
+  }
+  textarea { min-height: 66px; resize: vertical; font-family: ui-monospace, monospace; line-height: 1.5; }
+  input:focus, select:focus, textarea:focus { outline: none; border-color: var(--accent); box-shadow: var(--ring); }
+  input::placeholder, textarea::placeholder { color: var(--muted-2); }
+  .row { display: flex; gap: 10px; }
+  .row > * { flex: 1; min-width: 0; }
+  .checkboxes { display: flex; flex-wrap: wrap; gap: 8px; padding: 2px 0; }
+  .checkboxes label {
+    display: flex; align-items: center; gap: 6px; margin: 0; font-size: 12.5px; font-weight: 500;
+    color: var(--text); background: var(--bg-soft); border: 1px solid var(--border); padding: 5px 10px 5px 8px;
+    border-radius: 999px; cursor: pointer; transition: all .15s ease;
+  }
+  .checkboxes label:has(input:checked) { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+  .checkboxes input { width: auto; accent-color: var(--accent); }
+
+  /* ── Buttons ────────────────────────────────────────────────────────── */
+  button {
+    font: inherit; cursor: pointer; border-radius: var(--radius-sm); border: 1px solid var(--border);
+    background: var(--panel); color: var(--text); padding: 7px 14px; font-size: 13px; font-weight: 550;
+    display: inline-flex; align-items: center; gap: 6px; transition: all .15s ease;
+  }
+  button:hover { border-color: var(--muted-2); background: var(--bg-soft); }
+  button:active { transform: translateY(1px); }
+  button:disabled { opacity: .55; cursor: default; pointer-events: none; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); font-weight: 650; }
+  button.primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
+  button.danger { color: var(--danger); }
+  button.danger:hover { background: var(--danger-soft); border-color: var(--danger); }
+  button.ghost { background: transparent; border-color: transparent; color: var(--accent); padding: 4px 6px; font-size: 12px; }
+  button.ghost:hover { background: var(--accent-soft); }
+  button.small { padding: 5px 10px; font-size: 12px; }
+  .actions button { margin-left: 6px; }
+  .spinner {
+    width: 13px; height: 13px; border-radius: 50%; border: 2px solid currentColor;
+    border-right-color: transparent; animation: spin .7s linear infinite; opacity: .7;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .toolbar { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 14px; }
+  .toolbar-title { display: flex; flex-direction: column; gap: 2px; }
+
+  /* ── Curl block ─────────────────────────────────────────────────────── */
+  .curl-wrap { position: relative; margin-top: 6px; }
+  .curl {
+    background: var(--bg-soft); border: 1px solid var(--border); border-radius: var(--radius-sm);
+    padding: 12px 40px 12px 12px; font-family: ui-monospace, monospace; font-size: 12px; white-space: pre-wrap;
+    word-break: break-all; line-height: 1.6; color: var(--muted);
+  }
+  .curl .hl { color: var(--accent); }
+  .curl-copy {
+    position: absolute; top: 8px; right: 8px; width: 26px; height: 26px; padding: 0; justify-content: center;
+  }
+  form[hidden] { display: none; }
+  .divider { height: 1px; background: var(--border-soft); margin: 18px 0; }
+  .form-card { animation: rise .2s ease; }
+  .form-section-title { display: flex; align-items: center; gap: 7px; font-size: 13px; font-weight: 650; margin: 0 0 3px; }
+  .form-section-title svg { color: var(--muted); }
+
+  /* ── Toasts ─────────────────────────────────────────────────────────── */
+  .toasts { position: fixed; top: 16px; right: 16px; display: flex; flex-direction: column; gap: 8px; z-index: 100; }
+  .toast {
+    display: flex; align-items: flex-start; gap: 9px; background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; padding: 11px 14px; font-size: 13px; box-shadow: var(--shadow-lg); max-width: 340px;
+    animation: toast-in .25s cubic-bezier(.2,.9,.3,1.2);
+  }
+  .toast.leaving { animation: toast-out .18s ease forwards; }
+  @keyframes toast-in { from { opacity: 0; transform: translateX(16px) scale(.97); } to { opacity: 1; transform: none; } }
+  @keyframes toast-out { to { opacity: 0; transform: translateX(16px); } }
+  .toast svg { flex: none; margin-top: 1px; }
+  .toast.ok svg { color: var(--ok); }
+  .toast.err svg { color: var(--danger); }
+
+  @media (max-width: 640px) {
+    main { padding: 20px 14px 50px; }
+    .row { flex-direction: column; }
+    header { padding: 12px 16px; }
+  }
+</style>
+<script>
+  // Set the theme before first paint so there's no flash of the wrong palette.
+  (function () {
+    const saved = localStorage.getItem('llmproxy_theme');
+    const mode = saved || (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+    document.documentElement.setAttribute('data-theme', mode);
+  })();
+</script>
+</head>
+<body class="locked">
+
+<div class="toasts" id="toasts"></div>
+
+<header>
+  <div class="brand">
+    <div class="brand-mark">
+      <svg class="icon" viewBox="0 0 24 24"><path d="M4 6a8 4 0 0 1 16 0v12a8 4 0 0 1-16 0Z"/><path d="M4 6a8 4 0 0 0 16 0"/><path d="M4 12a8 4 0 0 0 16 0"/></svg>
+    </div>
+    <div class="brand-text">
+      <h1>LLM Proxy</h1>
+      <p>admin console</p>
+    </div>
+  </div>
+  <div class="right">
+    <button class="icon-btn" id="theme-toggle" onclick="toggleTheme()" title="Toggle theme"></button>
+    <button class="icon-btn app" onclick="lock()" title="Lock">
+      <svg class="icon" viewBox="0 0 24 24"><rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>
+    </button>
+  </div>
+</header>
+
+<div class="token-gate">
+  <div class="gate-mark">
+    <svg class="icon" viewBox="0 0 24 24"><rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/><circle cx="12" cy="15" r="1.4" fill="#fff" stroke="none"/></svg>
+  </div>
+  <h2>Unlock admin</h2>
+  <p>Paste the admin token from this host's <code>.env</code> (<code>ADMIN_TOKEN</code>). It stays only in this browser's local storage.</p>
+  <label>Admin token</label>
+  <input type="password" id="gate-token" placeholder="admin token" onkeydown="if(event.key==='Enter')unlock()">
+  <div style="margin-top:16px; display:flex; justify-content:flex-end">
+    <button class="primary" onclick="unlock()">
+      <svg class="icon" viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+      Unlock
+    </button>
+  </div>
+</div>
+
+<div class="app">
+  <main>
+    <div class="tabs">
+      <div class="tab active" data-tab="backends" onclick="showTab('backends')">
+        <svg class="icon" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="6" rx="1.5"/><rect x="3" y="14" width="18" height="6" rx="1.5"/><circle cx="7" cy="7" r=".6" fill="currentColor" stroke="none"/><circle cx="7" cy="17" r=".6" fill="currentColor" stroke="none"/></svg>
+        Backends <span class="count" id="tab-backends-count"></span>
+      </div>
+      <div class="tab" data-tab="teams" onclick="showTab('teams')">
+        <svg class="icon" viewBox="0 0 24 24"><path d="M16 19v-1.5a3.5 3.5 0 0 0-3.5-3.5h-5A3.5 3.5 0 0 0 4 17.5V19"/><circle cx="9" cy="8" r="3.2"/><path d="M18.5 19v-1.5a3.3 3.3 0 0 0-2.2-3.1"/><path d="M14.8 4.9a3.2 3.2 0 0 1 0 6.1"/></svg>
+        Teams <span class="count" id="tab-teams-count"></span>
+      </div>
+    </div>
+
+    <!-- ── Backends ─────────────────────────────────────────────────── -->
+    <div class="panel active" id="panel-backends">
+      <div class="card">
+        <div class="toolbar">
+          <div class="toolbar-title">
+            <h2><svg class="icon" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="6" rx="1.5"/><rect x="3" y="14" width="18" height="6" rx="1.5"/><circle cx="7" cy="7" r=".6" fill="currentColor" stroke="none"/><circle cx="7" cy="17" r=".6" fill="currentColor" stroke="none"/></svg>Backends</h2>
+            <span class="sub">OpenAI, vLLM, Ollama, or anything OpenAI-compatible</span>
+          </div>
+          <button class="primary" onclick="openBackendForm()">
+            <svg class="icon" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+            Add backend
+          </button>
+        </div>
+        <table id="backends-table">
+          <thead><tr><th>Name</th><th>Type</th><th>Base URL</th><th>Models</th><th></th></tr></thead>
+          <tbody></tbody>
+        </table>
+        <div class="empty" id="backends-empty" hidden>
+          <svg class="icon" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="6" rx="1.5"/><rect x="3" y="14" width="18" height="6" rx="1.5"/></svg>
+          <p>No backends yet. Connect OpenAI, a vLLM server, Ollama, or any OpenAI-compatible endpoint.</p>
+          <button class="primary small" onclick="openBackendForm()">Add your first backend</button>
+        </div>
+      </div>
+
+      <div class="card form-card" id="backend-form-card" hidden>
+        <h2 id="backend-form-title">Add backend</h2>
+        <form id="backend-form" onsubmit="saveBackend(event)">
+          <input type="hidden" id="bf-original-name">
+          <div class="row">
+            <div>
+              <label>Name</label>
+              <input type="text" id="bf-name" placeholder="e.g. vllm-prod" required>
+            </div>
+            <div>
+              <label>Type</label>
+              <select id="bf-type">
+                <option value="openai">OpenAI</option>
+                <option value="openai-compatible">OpenAI-compatible (generic)</option>
+                <option value="vllm">vLLM</option>
+                <option value="ollama">Ollama</option>
+              </select>
+            </div>
+          </div>
+          <label>Base URL</label>
+          <input type="url" id="bf-base-url" placeholder="https://api.openai.com" required>
+          <label>API key <span class="field-hint" id="bf-key-hint"></span></label>
+          <input type="password" id="bf-api-key" placeholder="leave blank if this backend needs no key">
+          <label>Models</label>
+          <textarea id="bf-models" placeholder="one model id per line"></textarea>
+          <div style="display:flex; align-items:center; gap:10px; margin-top:10px">
+            <button type="button" id="bf-test-btn" onclick="testBackend()">
+              <svg class="icon" viewBox="0 0 24 24"><path d="M13 2 3 14h7l-1 8 10-12h-7l1-8Z"/></svg>
+              Test connection &amp; fetch models
+            </button>
+            <span class="field-hint" id="bf-test-result"></span>
+          </div>
+          <div class="divider"></div>
+          <div style="display:flex; justify-content:flex-end; gap:8px">
+            <button type="button" onclick="closeBackendForm()">Cancel</button>
+            <button type="submit" class="primary">Save backend</button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <!-- ── Teams ────────────────────────────────────────────────────── -->
+    <div class="panel" id="panel-teams">
+      <div class="card">
+        <div class="toolbar">
+          <div class="toolbar-title">
+            <h2><svg class="icon" viewBox="0 0 24 24"><path d="M16 19v-1.5a3.5 3.5 0 0 0-3.5-3.5h-5A3.5 3.5 0 0 0 4 17.5V19"/><circle cx="9" cy="8" r="3.2"/></svg>Teams</h2>
+            <span class="sub">One token &amp; one Langfuse project per team</span>
+          </div>
+          <button class="primary" onclick="openTeamForm()">
+            <svg class="icon" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+            Add team
+          </button>
+        </div>
+        <table id="teams-table">
+          <thead><tr><th>Team</th><th>Token</th><th>Backends</th><th>Tracing</th><th></th></tr></thead>
+          <tbody></tbody>
+        </table>
+        <div class="empty" id="teams-empty" hidden>
+          <svg class="icon" viewBox="0 0 24 24"><path d="M16 19v-1.5a3.5 3.5 0 0 0-3.5-3.5h-5A3.5 3.5 0 0 0 4 17.5V19"/><circle cx="9" cy="8" r="3.2"/></svg>
+          <p>No teams yet. Add one, hand it its token, and it's ready to call the proxy.</p>
+          <button class="primary small" onclick="openTeamForm()">Add your first team</button>
+        </div>
+      </div>
+
+      <div class="card form-card" id="team-form-card" hidden>
+        <h2 id="team-form-title">Add team</h2>
+        <form id="team-form" onsubmit="saveTeam(event)">
+          <input type="hidden" id="tf-original-name">
+          <label>Team name</label>
+          <input type="text" id="tf-name" placeholder="e.g. team-search" required>
+          <label>Token <span class="field-hint">leave blank to auto-generate</span></label>
+          <div class="row">
+            <input type="text" id="tf-token" placeholder="auto-generated on save">
+            <button type="button" style="flex:0 0 auto" onclick="genToken()">
+              <svg class="icon" viewBox="0 0 24 24"><path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M3 22v-6h6"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/></svg>
+              Generate
+            </button>
+          </div>
+          <label>Backends this team may call</label>
+          <div class="checkboxes" id="tf-backends"></div>
+
+          <div class="divider"></div>
+          <div class="form-section-title">
+            <svg class="icon" viewBox="0 0 24 24"><path d="M3 3v18h18"/><path d="M7 15l4-6 3 3 5-8"/></svg>
+            Tracing — this team's Langfuse project
+          </div>
+          <p class="card-desc" style="margin-top:2px">Every chat/completions call from this team traces into its own project — model, input/output, token usage, latency. Leave blank to run this team with no tracing.</p>
+          <label>Langfuse host</label>
+          <input type="url" id="tf-lf-host" placeholder="http://langfuse.internal:3001">
+          <div class="row">
+            <div>
+              <label>Public key</label>
+              <input type="text" id="tf-lf-public-key" placeholder="pk-lf-...">
+            </div>
+            <div>
+              <label>Secret key <span class="field-hint" id="tf-lf-key-hint"></span></label>
+              <input type="password" id="tf-lf-secret-key" placeholder="leave blank to keep current">
+            </div>
+          </div>
+
+          <div class="divider"></div>
+          <div style="display:flex; justify-content:flex-end; gap:8px">
+            <button type="button" onclick="closeTeamForm()">Cancel</button>
+            <button type="submit" class="primary">Save team</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script>
+const TOKEN_KEY = 'llmproxy_admin_token';
+const THEME_KEY = 'llmproxy_theme';
+let backendsCache = {};
+let teamsCache = {};
+let publicBaseUrl = null; // set via /health if PUBLIC_BASE_URL is configured server-side
+
+// ── Theme ─────────────────────────────────────────────────────────────────
+const SUN = '<svg class="icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4.2"/><path d="M12 2v2.5M12 19.5V22M4.2 4.2l1.8 1.8M18 18l1.8 1.8M2 12h2.5M19.5 12H22M4.2 19.8 6 18M18 6l1.8-1.8"/></svg>';
+const MOON = '<svg class="icon" viewBox="0 0 24 24"><path d="M20 14.5A8.5 8.5 0 1 1 9.5 4a7 7 0 0 0 10.5 10.5Z"/></svg>';
+
+function applyTheme(mode) {
+  document.documentElement.setAttribute('data-theme', mode);
+  document.getElementById('theme-toggle').innerHTML = mode === 'dark' ? MOON : SUN;
+}
+function toggleTheme() {
+  const cur = document.documentElement.getAttribute('data-theme') ||
+    (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+  const next = cur === 'dark' ? 'light' : 'dark';
+  localStorage.setItem(THEME_KEY, next);
+  applyTheme(next);
+}
+(function initTheme() {
+  const saved = localStorage.getItem(THEME_KEY);
+  applyTheme(saved || (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'));
+})();
+
+// ── Toasts ────────────────────────────────────────────────────────────────
+const OK_ICON = '<svg class="icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="m8 12.5 2.5 2.5L16 9"/></svg>';
+const ERR_ICON = '<svg class="icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 8v5M12 16h.01"/></svg>';
+function toast(text, ok = true) {
+  const box = document.getElementById('toasts');
+  const el = document.createElement('div');
+  el.className = 'toast ' + (ok ? 'ok' : 'err');
+  el.innerHTML = (ok ? OK_ICON : ERR_ICON) + `<span>${esc(text)}</span>`;
+  box.appendChild(el);
+  setTimeout(() => {
+    el.classList.add('leaving');
+    setTimeout(() => el.remove(), 200);
+  }, 3600);
+}
+
+function getToken() { return localStorage.getItem(TOKEN_KEY) || ''; }
+
+async function api(path, opts = {}) {
+  const res = await fetch(path, {
+    ...opts,
+    headers: {
+      'Authorization': 'Bearer ' + getToken(),
+      'Content-Type': 'application/json',
+      ...(opts.headers || {}),
+    },
+  });
+  if (res.status === 401) {
+    lock('Session expired or wrong token — unlock again.');
+    throw new Error('unauthorized');
+  }
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.detail || body.error || ('HTTP ' + res.status));
+  return body;
+}
+
+function unlock() {
+  const t = document.getElementById('gate-token').value.trim();
+  if (!t) return;
+  localStorage.setItem(TOKEN_KEY, t);
+  document.body.classList.remove('locked');
+  loadAll();
+}
+
+function lock(msg) {
+  document.body.classList.add('locked');
+  if (msg) toast(msg, false);
+}
+
+function showTab(name) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === name));
+  document.querySelectorAll('.panel').forEach(p => p.classList.toggle('active', p.id === 'panel-' + name));
+}
+
+// ── Backends ──────────────────────────────────────────────────────────────
+const TYPE_LABEL = { openai: 'OpenAI', vllm: 'vLLM', ollama: 'Ollama', 'openai-compatible': 'Compatible' };
+
+async function loadBackends() {
+  backendsCache = await api('/admin/api/backends');
+  const tbody = document.querySelector('#backends-table tbody');
+  tbody.innerHTML = '';
+  const names = Object.keys(backendsCache).sort();
+  document.getElementById('backends-empty').hidden = names.length > 0;
+  document.querySelector('#backends-table').style.display = names.length ? '' : 'none';
+  document.getElementById('tab-backends-count').textContent = names.length || '';
+  for (const name of names) {
+    const b = backendsCache[name];
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td class="name-cell">${esc(name)}</td>
+      <td><span class="type-badge type-${esc(b.type)}"><span class="dot"></span>${esc(TYPE_LABEL[b.type] || b.type)}</span></td>
+      <td class="mono" style="max-width:220px; overflow-wrap:anywhere; color:var(--muted)">${esc(b.base_url)}</td>
+      <td>${(b.models || []).slice(0, 4).map(m => `<span class="chip">${esc(m)}</span>`).join('') || '<span style="color:var(--muted-2)">none</span>'}${(b.models || []).length > 4 ? `<span class="chip">+${b.models.length - 4}</span>` : ''}</td>
+      <td class="actions">
+        <button class="small" onclick="openBackendForm('${escAttr(name)}')">
+          <svg class="icon" viewBox="0 0 24 24"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
+        </button>
+        <button class="small danger" onclick="deleteBackend('${escAttr(name)}')">
+          <svg class="icon" viewBox="0 0 24 24"><path d="M4 7h16M9 7V5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2m-9 0 1 13a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-13"/></svg>
+        </button>
+      </td>`;
+    tbody.appendChild(tr);
+  }
+  renderTeamBackendCheckboxes();
+}
+
+function openBackendForm(name) {
+  document.getElementById('backend-form-card').hidden = false;
+  document.getElementById('backend-form').reset();
+  document.getElementById('bf-test-result').textContent = '';
+  if (name) {
+    const b = backendsCache[name];
+    document.getElementById('backend-form-title').textContent = 'Edit backend: ' + name;
+    document.getElementById('bf-original-name').value = name;
+    document.getElementById('bf-name').value = name;
+    document.getElementById('bf-name').disabled = true;
+    document.getElementById('bf-type').value = b.type;
+    document.getElementById('bf-base-url').value = b.base_url;
+    document.getElementById('bf-models').value = (b.models || []).join('\n');
+    document.getElementById('bf-key-hint').textContent = b.api_key ? `(currently set: ${b.api_key})` : '(none set)';
+  } else {
+    document.getElementById('backend-form-title').textContent = 'Add backend';
+    document.getElementById('bf-original-name').value = '';
+    document.getElementById('bf-name').disabled = false;
+    document.getElementById('bf-key-hint').textContent = '';
+  }
+  document.getElementById('backend-form-card').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+function closeBackendForm() { document.getElementById('backend-form-card').hidden = true; }
+
+function currentBackendFormValue() {
+  return {
+    type: document.getElementById('bf-type').value,
+    base_url: document.getElementById('bf-base-url').value.trim(),
+    api_key: document.getElementById('bf-api-key').value,
+    models: document.getElementById('bf-models').value.split('\n').map(s => s.trim()).filter(Boolean),
+  };
+}
+
+async function testBackend() {
+  const name = document.getElementById('bf-original-name').value || document.getElementById('bf-name').value;
+  const resultEl = document.getElementById('bf-test-result');
+  const btn = document.getElementById('bf-test-btn');
+  const original = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> Testing…';
+  resultEl.textContent = '';
+  try {
+    const res = await api(`/admin/api/backends/${encodeURIComponent(name || 'new')}/test`, {
+      method: 'POST', body: JSON.stringify(currentBackendFormValue()),
+    });
+    if (res.ok) {
+      resultEl.innerHTML = `<span style="color:var(--ok)">✓ found ${res.models.length} model(s)</span>`;
+      document.getElementById('bf-models').value = res.models.join('\n');
+    } else {
+      resultEl.innerHTML = `<span style="color:var(--danger)">✕ ${esc(res.error)}</span>`;
+    }
+  } catch (e) { resultEl.innerHTML = `<span style="color:var(--danger)">✕ ${esc(e.message)}</span>`; }
+  btn.disabled = false;
+  btn.innerHTML = original;
+}
+
+async function saveBackend(ev) {
+  ev.preventDefault();
+  const original = document.getElementById('bf-original-name').value;
+  const name = original || document.getElementById('bf-name').value.trim();
+  try {
+    await api(`/admin/api/backends/${encodeURIComponent(name)}`, {
+      method: 'PUT', body: JSON.stringify(currentBackendFormValue()),
+    });
+    closeBackendForm();
+    toast(`Saved backend "${name}".`);
+    await loadBackends();
+  } catch (e) { toast(e.message, false); }
+}
+
+async function deleteBackend(name) {
+  if (!confirm(`Delete backend "${name}"?`)) return;
+  try {
+    await api(`/admin/api/backends/${encodeURIComponent(name)}`, { method: 'DELETE' });
+    toast(`Deleted "${name}".`);
+    await loadBackends();
+  } catch (e) { toast(e.message, false); }
+}
+
+// ── Teams ─────────────────────────────────────────────────────────────────
+async function loadTeams() {
+  teamsCache = await api('/admin/api/teams');
+  renderTeams();
+}
+
+function renderTeams() {
+  const tbody = document.querySelector('#teams-table tbody');
+  tbody.innerHTML = '';
+  const names = Object.keys(teamsCache).sort();
+  document.getElementById('teams-empty').hidden = names.length > 0;
+  document.querySelector('#teams-table').style.display = names.length ? '' : 'none';
+  document.getElementById('tab-teams-count').textContent = names.length || '';
+  for (const name of names) {
+    const t = teamsCache[name];
+    const lf = t.langfuse || {};
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td class="name-cell">${esc(name)}</td>
+      <td><span class="mono" style="color:var(--muted)">${esc(shortToken(t.token))}</span>
+        <button class="ghost" title="Copy token" onclick="copyText('${escAttr(t.token)}', this)">
+          <svg class="icon" viewBox="0 0 24 24"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
+        </button></td>
+      <td>${(t.backends || []).map(b => `<span class="chip">${esc(b)}</span>`).join('') || '<span style="color:var(--muted-2)">none</span>'}</td>
+      <td>${lf.enabled ? `<span class="chip tracing-on">● ${esc(lf.host || '')}</span>` : '<span class="chip tracing-off">off</span>'}</td>
+      <td class="actions">
+        <button class="small" onclick="showCurl('${escAttr(name)}')">
+          <svg class="icon" viewBox="0 0 24 24"><path d="m8 9-3 3 3 3M16 9l3 3-3 3M13 5l-2 14"/></svg>
+        </button>
+        <button class="small" onclick="openTeamForm('${escAttr(name)}')">
+          <svg class="icon" viewBox="0 0 24 24"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
+        </button>
+        <button class="small danger" onclick="deleteTeam('${escAttr(name)}')">
+          <svg class="icon" viewBox="0 0 24 24"><path d="M4 7h16M9 7V5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2m-9 0 1 13a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-13"/></svg>
+        </button>
+      </td>`;
+    tbody.appendChild(tr);
+    if (t._showCurl) {
+      const curlTr = document.createElement('tr');
+      curlTr.innerHTML = `<td></td><td colspan="4">${curlBlock(name, t)}</td>`;
+      tbody.appendChild(curlTr);
+    }
+  }
+}
+
+function shortToken(tok) {
+  if (!tok) return '';
+  return tok.length > 14 ? tok.slice(0, 8) + '…' + tok.slice(-4) : tok;
+}
+
+function curlBlock(name, t) {
+  const origin = publicBaseUrl || window.location.origin;
+  return (t.backends || []).map((bname, i) => {
+    const b = backendsCache[bname];
+    if (!b) return '';
+    const model = (b.models && b.models[0]) || '<model>';
+    const cmd = `curl ${origin}/${bname}/v1/chat/completions \\\n  -H "Authorization: Bearer ${t.token}" -H "Content-Type: application/json" \\\n  -d '{"model": "${model}", "messages": [{"role": "user", "content": "hi"}]}'`;
+    const id = `curl-${name}-${i}`;
+    return `<div class="curl-wrap"><div class="curl" id="${id}">${esc(cmd)}</div>
+      <button class="curl-copy small" title="Copy" onclick="copyText(document.getElementById('${id}').textContent, this)">
+        <svg class="icon" viewBox="0 0 24 24"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
+      </button></div>`;
+  }).join('');
+}
+
+function showCurl(name) {
+  teamsCache[name]._showCurl = !teamsCache[name]._showCurl;
+  renderTeams();
+}
+
+function renderTeamBackendCheckboxes(selected) {
+  const box = document.getElementById('tf-backends');
+  const names = Object.keys(backendsCache).sort();
+  box.innerHTML = names.length
+    ? names.map(n => `<label><input type="checkbox" value="${escAttr(n)}" ${selected && selected.includes(n) ? 'checked' : ''}> ${esc(n)}</label>`).join('')
+    : '<span style="color:var(--muted); font-size:13px">Add a backend first.</span>';
+}
+
+function openTeamForm(name) {
+  document.getElementById('team-form-card').hidden = false;
+  document.getElementById('team-form').reset();
+  if (name) {
+    const t = teamsCache[name];
+    const lf = t.langfuse || {};
+    document.getElementById('team-form-title').textContent = 'Edit team: ' + name;
+    document.getElementById('tf-original-name').value = name;
+    document.getElementById('tf-name').value = name;
+    document.getElementById('tf-name').disabled = true;
+    document.getElementById('tf-token').value = t.token;
+    document.getElementById('tf-token').placeholder = '';
+    document.getElementById('tf-lf-host').value = lf.host || '';
+    document.getElementById('tf-lf-public-key').value = lf.public_key || '';
+    document.getElementById('tf-lf-key-hint').textContent = lf.secret_key ? `(currently set: ${lf.secret_key})` : '(none set)';
+    renderTeamBackendCheckboxes(t.backends || []);
+  } else {
+    document.getElementById('team-form-title').textContent = 'Add team';
+    document.getElementById('tf-original-name').value = '';
+    document.getElementById('tf-name').disabled = false;
+    document.getElementById('tf-token').placeholder = 'auto-generated on save';
+    document.getElementById('tf-lf-key-hint').textContent = '';
+    renderTeamBackendCheckboxes([]);
+  }
+  document.getElementById('team-form-card').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+function closeTeamForm() { document.getElementById('team-form-card').hidden = true; }
+
+function genToken() {
+  const bytes = new Uint8Array(24);
+  crypto.getRandomValues(bytes);
+  document.getElementById('tf-token').value = Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function saveTeam(ev) {
+  ev.preventDefault();
+  const original = document.getElementById('tf-original-name').value;
+  const name = original || document.getElementById('tf-name').value.trim();
+  const backends = Array.from(document.querySelectorAll('#tf-backends input:checked')).map(el => el.value);
+  try {
+    const res = await api(`/admin/api/teams/${encodeURIComponent(name)}`, {
+      method: 'PUT',
+      body: JSON.stringify({
+        token: document.getElementById('tf-token').value.trim(),
+        backends,
+        langfuse_host: document.getElementById('tf-lf-host').value.trim(),
+        langfuse_public_key: document.getElementById('tf-lf-public-key').value.trim(),
+        langfuse_secret_key: document.getElementById('tf-lf-secret-key').value,
+      }),
+    });
+    closeTeamForm();
+    toast(`Saved team "${name}" — tracing ${res.tracing_enabled ? 'on' : 'off'}.`);
+    await loadTeams();
+  } catch (e) { toast(e.message, false); }
+}
+
+async function deleteTeam(name) {
+  if (!confirm(`Delete team "${name}"? Its token stops working immediately.`)) return;
+  try {
+    await api(`/admin/api/teams/${encodeURIComponent(name)}`, { method: 'DELETE' });
+    toast(`Deleted "${name}".`);
+    await loadTeams();
+  } catch (e) { toast(e.message, false); }
+}
+
+function copyText(text, btn) {
+  navigator.clipboard?.writeText(text).then(() => {
+    if (!btn) return;
+    const original = btn.innerHTML;
+    btn.innerHTML = '<svg class="icon" viewBox="0 0 24 24"><path d="m5 13 4 4L19 7"/></svg>';
+    setTimeout(() => { btn.innerHTML = original; }, 1200);
+  }).catch(() => {});
+}
+
+// ── Misc ──────────────────────────────────────────────────────────────────
+function esc(s) { return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function escAttr(s) { return esc(s).replace(/"/g, '&quot;'); }
+
+async function loadAll() {
+  await Promise.all([
+    loadBackends(),
+    loadTeams(),
+    fetch('/health').then(r => r.json()).then(h => { publicBaseUrl = h.public_base_url || null; }).catch(() => {}),
+  ]);
+}
+
+if (getToken()) {
+  document.body.classList.remove('locked');
+  loadAll().catch(() => {});
+}
+</script>
+</body>
+</html>
