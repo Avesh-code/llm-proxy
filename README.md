@@ -4,7 +4,9 @@ A single, self-hosted entry point for every LLM your org uses — OpenAI, vLLM,
 Ollama, or anything else that speaks the OpenAI API. Each team gets its own
 bearer token, its own allow-list of backends, and its own Langfuse project
 for tracing. Backends and teams are managed live from a built-in admin UI —
-no redeploys to onboard a team or add a model server.
+no redeploys to onboard a team or add a model server.  
+
+![Architecture](proxy-architecture.png)  
 
 ```
  developers / team A  ──┐
