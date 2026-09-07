@@ -26,6 +26,7 @@ no redeploys to onboard a team or add a model server.
 - [Configuration reference](#configuration-reference)
 - [API reference](#api-reference)
 - [Tracing](#tracing)
+- [Cost tracking](#cost-tracking)
 - [Production deployment](#production-deployment)
 - [Security](#security)
 - [Troubleshooting](#troubleshooting)
@@ -50,6 +51,12 @@ no redeploys to onboard a team or add a model server.
   *that team's own* Langfuse project (model, input/output, token usage,
   latency, tagged by backend). A team with no Langfuse keys configured just
   runs untraced — nothing else has to know or care.
+- **Cost is computed by the proxy, not guessed by Langfuse.** Langfuse only
+  auto-prices models it recognizes by name, so a self-hosted model, a custom
+  fine-tune, or anything it doesn't know shows up as a flat $0. Set a price
+  per model in `/admin` and the proxy computes real cost from the token
+  usage in the backend's own response and forwards it explicitly — see
+  [Cost tracking](#cost-tracking).
 
 ## Quick start
 
@@ -101,7 +108,10 @@ curl http://<this-host>:4000/whoami -H "Authorization: Bearer <their token>"
     {
       "backend": "ollama-local",
       "base_url": "http://<this-host>:4000/ollama-local",
-      "models": ["llama3", "mistral"],
+      "models": [
+        {"id": "llama3", "input_price": 0, "output_price": 0},
+        {"id": "mistral", "input_price": 0, "output_price": 0}
+      ],
       "example_curl": "curl http://<this-host>:4000/ollama-local/v1/chat/completions -H \"Authorization: Bearer ...\" ..."
     }
   ]
@@ -150,7 +160,7 @@ isn't lost on `docker compose up -d --force-recreate` or an image rebuild.
 |---|---|---|
 | `POST/GET/... /<backend>/<path>` | team token | The actual proxy. Forwards to `<backend>`'s `base_url + /<path>`. `chat/completions`-shaped calls are traced to that team's Langfuse project; everything else passes through untraced. |
 | `GET /whoami` | team token | This team's allowed backends, their models, and a ready-to-run curl example. |
-| `GET /v1/models`, `GET /models` | team token | OpenAI-style model list, filtered to what this team's token can reach. |
+| `GET /v1/models`, `GET /models` | team token | OpenAI-style model list, filtered to what this team's token can reach, including each model's `input_price_per_1m`/`output_price_per_1m`. |
 | `GET /health` | none | Liveness + a non-secret summary: backend names/types/models, team names/allowed-backends/tracing-on-off, `public_base_url`. |
 | `GET /admin` | none (page is static; its API calls are gated) | The admin UI. |
 | `GET/PUT/DELETE /admin/api/backends[/{name}]` | admin token | Manage backends. `PUT` upserts (create or update); an empty `api_key` on update keeps the existing one. |
@@ -177,6 +187,45 @@ rather than needing a separate code path.
 
 There's no global tracing switch by design: since each team owns its own
 project, there's nothing meaningful for a proxy-wide toggle to control.
+
+## Cost tracking
+
+Langfuse prices a generation by matching its `model` name against its own
+built-in price list. That works fine for `gpt-4o`. It does nothing for a
+self-hosted vLLM/Ollama model, a fine-tune, or any model id Langfuse simply
+doesn't recognize — those all show a flat **$0**, token usage and all,
+because there's no per-token price for Langfuse to multiply against.
+
+The proxy fixes this by owning pricing itself instead of leaving it to
+Langfuse's lookup. On a backend's card in `/admin`, the **Models** field
+takes one model per line:
+
+```
+gpt-4o
+gpt-5.6-luna, 5, 15
+llama3
+```
+
+- `gpt-4o` — no price given. Langfuse already knows how to price this one
+  correctly, so the proxy doesn't interfere.
+- `gpt-5.6-luna, 5, 15` — a model Langfuse can't price on its own. `5` and
+  `15` are USD per 1,000,000 input/output tokens. On every request, the
+  proxy takes the token counts straight from that backend's own response
+  and computes the real cost, forwarding it to Langfuse as an explicit
+  override instead of letting the lookup silently fail to $0.
+- `llama3` — no price, self-hosted. Genuinely free, so leaving it blank is
+  correct; nothing gets overridden.
+
+The rule the proxy actually applies (`_compute_cost` in `proxy.py`): if a
+model has at least one non-zero price configured, its cost is computed from
+that price and forwarded explicitly; otherwise the proxy sends nothing and
+Langfuse falls back to its own lookup exactly as before. So filling in a
+price only ever fixes a model that was showing $0 — it never overrides a
+model Langfuse was already pricing correctly.
+
+`GET /v1/models` also exposes each model's `input_price_per_1m` /
+`output_price_per_1m`, so a client (or a cost-estimating tool) can look up
+pricing the same way.
 
 ## Production deployment
 
@@ -255,6 +304,11 @@ proxy container can reach that Langfuse host. A failed export logs
 
 **Curl examples show the wrong host** — set `PUBLIC_BASE_URL` in `.env` (see
 [Configuration reference](#configuration-reference)).
+
+**A model shows $0 cost in Langfuse even though tokens were used** —
+Langfuse doesn't recognize that model name and has no built-in price for it
+(common for self-hosted, custom, or newly-released models). Set its price
+on that backend's card in `/admin` — see [Cost tracking](#cost-tracking).
 
 ## Development
 

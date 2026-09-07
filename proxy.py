@@ -63,6 +63,13 @@ class ConfigStore:
         data.setdefault("teams", {})
         for cfg in data["teams"].values():
             cfg.setdefault("langfuse", {"enabled": False, "host": "", "public_key": "", "secret_key": ""})
+        # Upgrade a config.json written before per-model pricing existed,
+        # where "models" was just a list of id strings.
+        for cfg in data["backends"].values():
+            cfg["models"] = [
+                m if isinstance(m, dict) else {"id": m, "input_price": 0.0, "output_price": 0.0}
+                for m in cfg.get("models", [])
+            ]
         return data
 
     def _migrate_from_yaml(self, legacy_yaml_path: str) -> dict:
@@ -88,7 +95,8 @@ class ConfigStore:
                 "type":     cfg.get("type", "openai"),
                 "base_url": cfg["base_url"].rstrip("/"),
                 "api_key":  os.getenv(api_key_env, "") if api_key_env else "",
-                "models":   cfg.get("models") or [],
+                "models":   [{"id": m, "input_price": 0.0, "output_price": 0.0}
+                             for m in (cfg.get("models") or [])],
             }
         for name, cfg in (raw.get("teams") or {}).items():
             token_env = cfg.get("token_env")
@@ -294,7 +302,7 @@ async def whoami(request: Request):
         b = BACKENDS.get(name)
         if not b:
             continue
-        example_model = b["models"][0] if b["models"] else "<model>"
+        example_model = b["models"][0]["id"] if b["models"] else "<model>"
         out.append({
             "backend":  name,
             "base_url": f"{base}/{name}",
@@ -321,7 +329,11 @@ async def list_models(request: Request):
         if not b:
             continue
         for m in b["models"]:
-            data.append({"id": m, "object": "model", "owned_by": name, "backend": name})
+            data.append({
+                "id": m["id"], "object": "model", "owned_by": name, "backend": name,
+                "input_price_per_1m":  m.get("input_price", 0.0),
+                "output_price_per_1m": m.get("output_price", 0.0),
+            })
     return {"object": "list", "data": data}
 
 
@@ -342,11 +354,17 @@ def _mask(secret: str) -> str:
     return secret[:4] + "…" + secret[-4:] if len(secret) > 10 else "•" * len(secret)
 
 
+class ModelPriceIn(BaseModel):
+    id: str
+    input_price: float = 0.0    # USD per 1,000,000 input tokens
+    output_price: float = 0.0   # USD per 1,000,000 output tokens
+
+
 class BackendIn(BaseModel):
     type: str = "openai"        # openai | vllm | ollama | openai-compatible
     base_url: str
     api_key: str = ""           # PUT with "" on an existing backend keeps the current key
-    models: list[str] = []
+    models: list[ModelPriceIn] = []
 
 
 class TeamIn(BaseModel):
@@ -373,7 +391,7 @@ async def admin_upsert_backend(name: str, body: BackendIn):
         "type":     body.type,
         "base_url": body.base_url.rstrip("/"),
         "api_key":  body.api_key or existing.get("api_key", ""),
-        "models":   body.models,
+        "models":   [m.model_dump() for m in body.models],
     }
     await store.save()
     _rebuild_indexes()
@@ -500,6 +518,34 @@ def _parse_usage(usage):
         "output": usage.get("completion_tokens", 0),
         "total":  usage.get("total_tokens",      0),
     }
+
+
+def _compute_cost(backend_cfg: dict, model: str, usage: dict):
+    """
+    Langfuse only auto-prices models it recognizes by name — a self-hosted
+    model, a custom fine-tune, or a typo'd model id all silently show $0.
+    So pricing is looked up from what's configured on the backend itself
+    (set per-model in /admin, in USD per 1,000,000 tokens) and forwarded as
+    an explicit cost, bypassing Langfuse's own lookup entirely.
+
+    Returns None — meaning "don't override, let Langfuse do its own
+    lookup" — whenever the model isn't registered here or has no price set,
+    so a genuinely free/self-hosted model or a model Langfuse already prices
+    correctly (e.g. real gpt-4o with nothing entered) isn't clobbered with
+    an explicit $0.
+    """
+    if not usage:
+        return None
+    price = next((m for m in backend_cfg.get("models", []) if m.get("id") == model), None)
+    if not price:
+        return None
+    input_price  = price.get("input_price")  or 0.0
+    output_price = price.get("output_price") or 0.0
+    if not input_price and not output_price:
+        return None
+    input_cost  = round((usage["input"]  / 1_000_000) * input_price,  8)
+    output_cost = round((usage["output"] / 1_000_000) * output_price, 8)
+    return {"input": input_cost, "output": output_cost, "total": round(input_cost + output_cost, 8)}
 
 
 def _extract_output(parsed):
@@ -645,6 +691,7 @@ async def proxy(backend: str, rest: str, request: Request, background_tasks: Bac
                             full = b"".join(collected)
                             parsed, usage_data = _parse_stream_buffer(full)
                             usage = _parse_usage(usage_data)
+                            cost  = _compute_cost(backend_cfg, model, usage)
                             try:
                                 output = _extract_output(parsed)
                                 if err_box[0]:
@@ -652,7 +699,7 @@ async def proxy(backend: str, rest: str, request: Request, background_tasks: Bac
                                                     metadata={"latency_ms": ms})
                                     root_span.update(level="ERROR", metadata={"latency_ms": ms})
                                 else:
-                                    gen_span.update(output=output, usage_details=usage,
+                                    gen_span.update(output=output, usage_details=usage, cost_details=cost,
                                                     metadata={"latency_ms": ms})
                                     root_span.update(output=output, metadata={"latency_ms": ms})
                                 langfuse.flush()
@@ -695,12 +742,14 @@ async def proxy(backend: str, rest: str, request: Request, background_tasks: Bac
                     level  = "ERROR" if r.status_code >= 400 else "DEFAULT"
                     output = _extract_output(parsed)
                     usage  = _parse_usage(parsed.get("usage") if parsed else None)
+                    cost   = _compute_cost(backend_cfg, model, usage)
 
                     gen_span.update(
                         output         = output,
                         level          = level,
                         status_message = r.text if r.status_code >= 400 else None,
                         usage_details  = usage,
+                        cost_details   = cost,
                         metadata       = {"latency_ms": ms, "status_code": r.status_code},
                     )
                     root_span.update(output=output, level=level, metadata={"latency_ms": ms})

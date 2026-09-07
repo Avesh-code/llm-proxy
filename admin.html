@@ -364,8 +364,13 @@
           <input type="url" id="bf-base-url" placeholder="https://api.openai.com" required>
           <label>API key <span class="field-hint" id="bf-key-hint"></span></label>
           <input type="password" id="bf-api-key" placeholder="leave blank if this backend needs no key">
-          <label>Models</label>
-          <textarea id="bf-models" placeholder="one model id per line"></textarea>
+          <label>Models <span class="field-hint">one per line: <code>model-id, input $/1M tokens, output $/1M tokens</code> — prices optional, omit for a free/self-hosted model</span></label>
+          <textarea id="bf-models" placeholder="gpt-4o, 2.50, 10.00&#10;llama3"></textarea>
+          <p class="field-hint" style="margin:4px 0 0">
+            Langfuse only auto-prices models it recognizes by name — anything self-hosted, custom,
+            or fine-tuned shows $0 unless you set a price here, which the proxy then forwards as the
+            actual cost instead of relying on Langfuse's own lookup.
+          </p>
           <div style="display:flex; align-items:center; gap:10px; margin-top:10px">
             <button type="button" id="bf-test-btn" onclick="testBackend()">
               <svg class="icon" viewBox="0 0 24 24"><path d="M13 2 3 14h7l-1 8 10-12h-7l1-8Z"/></svg>
@@ -551,7 +556,7 @@ async function loadBackends() {
       <td class="name-cell">${esc(name)}</td>
       <td><span class="type-badge type-${esc(b.type)}"><span class="dot"></span>${esc(TYPE_LABEL[b.type] || b.type)}</span></td>
       <td class="mono" style="max-width:220px; overflow-wrap:anywhere; color:var(--muted)">${esc(b.base_url)}</td>
-      <td>${(b.models || []).slice(0, 4).map(m => `<span class="chip">${esc(m)}</span>`).join('') || '<span style="color:var(--muted-2)">none</span>'}${(b.models || []).length > 4 ? `<span class="chip">+${b.models.length - 4}</span>` : ''}</td>
+      <td>${(b.models || []).slice(0, 4).map(m => `<span class="chip" title="${m.input_price || m.output_price ? `$${m.input_price}/$${m.output_price} per 1M in/out` : 'no price set'}">${esc(m.id)}${m.input_price || m.output_price ? ' $' : ''}</span>`).join('') || '<span style="color:var(--muted-2)">none</span>'}${(b.models || []).length > 4 ? `<span class="chip">+${b.models.length - 4}</span>` : ''}</td>
       <td class="actions">
         <button class="small" onclick="openBackendForm('${escAttr(name)}')">
           <svg class="icon" viewBox="0 0 24 24"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
@@ -577,7 +582,7 @@ function openBackendForm(name) {
     document.getElementById('bf-name').disabled = true;
     document.getElementById('bf-type').value = b.type;
     document.getElementById('bf-base-url').value = b.base_url;
-    document.getElementById('bf-models').value = (b.models || []).join('\n');
+    document.getElementById('bf-models').value = formatModelsText(b.models);
     document.getElementById('bf-key-hint').textContent = b.api_key ? `(currently set: ${b.api_key})` : '(none set)';
   } else {
     document.getElementById('backend-form-title').textContent = 'Add backend';
@@ -590,12 +595,30 @@ function openBackendForm(name) {
 
 function closeBackendForm() { document.getElementById('backend-form-card').hidden = true; }
 
+// Models textarea format: one per line, "model-id" or "model-id, input$/1M, output$/1M".
+// Omitting prices (or leaving them 0) means "let Langfuse price this itself" for a
+// recognized model, or "genuinely free" for a self-hosted one — see _compute_cost in proxy.py.
+function parseModelsText(text) {
+  return text.split('\n').map(s => s.trim()).filter(Boolean).map(line => {
+    const parts = line.split(',').map(p => p.trim());
+    return {
+      id: parts[0],
+      input_price: parseFloat(parts[1]) || 0,
+      output_price: parseFloat(parts[2]) || 0,
+    };
+  });
+}
+
+function formatModelsText(models) {
+  return (models || []).map(m => (m.input_price || m.output_price) ? `${m.id}, ${m.input_price}, ${m.output_price}` : m.id).join('\n');
+}
+
 function currentBackendFormValue() {
   return {
     type: document.getElementById('bf-type').value,
     base_url: document.getElementById('bf-base-url').value.trim(),
     api_key: document.getElementById('bf-api-key').value,
-    models: document.getElementById('bf-models').value.split('\n').map(s => s.trim()).filter(Boolean),
+    models: parseModelsText(document.getElementById('bf-models').value),
   };
 }
 
@@ -613,7 +636,12 @@ async function testBackend() {
     });
     if (res.ok) {
       resultEl.innerHTML = `<span style="color:var(--ok)">✓ found ${res.models.length} model(s)</span>`;
-      document.getElementById('bf-models').value = res.models.join('\n');
+      // Merge into what's already typed so existing prices survive a re-test.
+      const byId = Object.fromEntries(parseModelsText(document.getElementById('bf-models').value).map(m => [m.id, m]));
+      for (const id of res.models) {
+        if (!byId[id]) byId[id] = { id, input_price: 0, output_price: 0 };
+      }
+      document.getElementById('bf-models').value = formatModelsText(Object.values(byId));
     } else {
       resultEl.innerHTML = `<span style="color:var(--danger)">✕ ${esc(res.error)}</span>`;
     }
@@ -700,7 +728,7 @@ function curlBlock(name, t) {
   return (t.backends || []).map((bname, i) => {
     const b = backendsCache[bname];
     if (!b) return '';
-    const model = (b.models && b.models[0]) || '<model>';
+    const model = (b.models && b.models[0] && b.models[0].id) || '<model>';
     const cmd = `curl ${origin}/${bname}/v1/chat/completions \\\n  -H "Authorization: Bearer ${t.token}" -H "Content-Type: application/json" \\\n  -d '{"model": "${model}", "messages": [{"role": "user", "content": "hi"}]}'`;
     const id = `curl-${name}-${i}`;
     return `<div class="curl-wrap"><div class="curl" id="${id}">${esc(cmd)}</div>
