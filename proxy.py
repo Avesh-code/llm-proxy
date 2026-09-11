@@ -699,57 +699,69 @@ async def proxy(backend: str, rest: str, request: Request, background_tasks: Bac
         collected = []
         err_box   = [None]
 
+        # Deliberately NOT a `with` block. `stream_gen` below is an async
+        # generator — its body doesn't run until Starlette iterates it while
+        # writing the response, which happens after this function returns.
+        # A `with langfuse.start_as_current_observation(...):` wrapped around
+        # that `return` would exit (ending the span, locking in ~0 latency)
+        # immediately on return, before any real streaming — or its eventual
+        # .update() — ever happened. Managing the spans manually and ending
+        # them from inside stream_gen()'s `finally` keeps them open for the
+        # actual duration of the stream instead.
         with propagate_attributes(user_id=user_id, tags=tags):
-            with langfuse.start_as_current_observation(
+            root_span = langfuse.start_observation(
                 as_type  = "span",
                 name     = trace_name,
                 input    = messages,
                 metadata = {"path": f"/{backend}/{rest}", "model": model, "backend": backend, "service": service},
-            ) as root_span:
-                with langfuse.start_as_current_observation(
-                    as_type          = "generation",
-                    name             = "chat-completion",
-                    model            = model,
-                    input            = messages,
-                    model_parameters = {
-                        "temperature": body_j.get("temperature"),
-                        "max_tokens":  body_j.get("max_tokens"),
-                        "top_p":       body_j.get("top_p"),
-                    },
-                ) as gen_span:
-                    async def stream_gen():
-                        try:
-                            async with http_client.stream(
-                                method=request.method, url=url, headers=headers, content=body_b
-                            ) as r:
-                                async for chunk in r.aiter_bytes():
-                                    collected.append(chunk)
-                                    yield chunk
-                        except Exception as e:
-                            err_box[0] = str(e)
-                            raise
-                        finally:
-                            ms   = int((time.time() - start_ms) * 1000)
-                            full = b"".join(collected)
-                            parsed, usage_data = _parse_stream_buffer(full)
-                            usage = _parse_usage(usage_data)
-                            cost  = _compute_cost(backend_cfg, model, usage)
-                            try:
-                                output = _extract_output(parsed)
-                                if err_box[0]:
-                                    gen_span.update(level="ERROR", status_message=err_box[0],
-                                                    metadata={"latency_ms": ms})
-                                    root_span.update(level="ERROR", metadata={"latency_ms": ms})
-                                else:
-                                    gen_span.update(output=output, usage_details=usage, cost_details=cost,
-                                                    metadata={"latency_ms": ms})
-                                    root_span.update(output=output, metadata={"latency_ms": ms})
-                                langfuse.flush()
-                            except Exception as e:
-                                print(f"Langfuse error: {e}", flush=True)
-                            _log(request.method, f"{backend}/{rest}", "stream", ms, model, service)
+            )
+            gen_span = root_span.start_observation(
+                as_type          = "generation",
+                name             = "chat-completion",
+                model            = model,
+                input            = messages,
+                model_parameters = {
+                    "temperature": body_j.get("temperature"),
+                    "max_tokens":  body_j.get("max_tokens"),
+                    "top_p":       body_j.get("top_p"),
+                },
+            )
 
-                    return StreamingResponse(stream_gen(), media_type="text/event-stream")
+        async def stream_gen():
+            try:
+                async with http_client.stream(
+                    method=request.method, url=url, headers=headers, content=body_b
+                ) as r:
+                    async for chunk in r.aiter_bytes():
+                        collected.append(chunk)
+                        yield chunk
+            except Exception as e:
+                err_box[0] = str(e)
+                raise
+            finally:
+                ms   = int((time.time() - start_ms) * 1000)
+                full = b"".join(collected)
+                parsed, usage_data = _parse_stream_buffer(full)
+                usage = _parse_usage(usage_data)
+                cost  = _compute_cost(backend_cfg, model, usage)
+                try:
+                    output = _extract_output(parsed)
+                    if err_box[0]:
+                        gen_span.update(level="ERROR", status_message=err_box[0],
+                                        metadata={"latency_ms": ms})
+                        root_span.update(level="ERROR", metadata={"latency_ms": ms})
+                    else:
+                        gen_span.update(output=output, usage_details=usage, cost_details=cost,
+                                        metadata={"latency_ms": ms})
+                        root_span.update(output=output, metadata={"latency_ms": ms})
+                    gen_span.end()
+                    root_span.end()
+                    langfuse.flush()
+                except Exception as e:
+                    print(f"Langfuse error: {e}", flush=True)
+                _log(request.method, f"{backend}/{rest}", "stream", ms, model, service)
+
+        return StreamingResponse(stream_gen(), media_type="text/event-stream")
 
     # ── Non-streaming ──────────────────────────────────────────────────────────
     with propagate_attributes(user_id=user_id, tags=tags):
