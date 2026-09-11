@@ -245,10 +245,15 @@ Health check:            http://<this-host>:{PROXY_PORT}/health
 
 app = FastAPI(lifespan=lifespan)
 
-LLM_ENDPOINTS = {
-    "v1/chat/completions", "v1/completions",
-    "chat/completions",    "completions",
-    "v1/responses",        "responses",
+# Only these paths are known to accept OpenAI's Chat-Completions-style
+# stream_options.include_usage — used solely to decide whether it's safe to
+# inject that field before streaming (see the "Streaming" section below).
+# Everything else (Responses API, Ollama native, Anthropic-shaped, anything
+# unrecognized) is left completely untouched, since we don't know what
+# extra fields it tolerates.
+CHAT_COMPLETIONS_STREAM_PATHS = {
+    "v1/chat/completions", "chat/completions",
+    "v1/completions",      "completions",
 }
 
 RESERVED_BACKEND_NAMES = {"admin", "health", "whoami", "v1", "models"}
@@ -511,19 +516,36 @@ def _resp_headers(h) -> dict:
     return out
 
 
+def _find_usage_dict(parsed: dict):
+    """
+    Locates whatever holds the token counts, regardless of API shape.
+    Chat Completions and the Responses API both nest a "usage" object;
+    Ollama's native /api/chat and /api/generate don't nest anything — the
+    counts (prompt_eval_count, eval_count) sit directly on the response body.
+    """
+    if not parsed:
+        return None
+    if isinstance(parsed.get("usage"), dict):
+        return parsed["usage"]
+    if "prompt_eval_count" in parsed or "eval_count" in parsed:
+        return parsed
+    return None
+
+
 def _parse_usage(usage):
     """
-    Chat Completions names these prompt_tokens/completion_tokens; the newer
-    Responses API (POST /v1/responses) names the same two things
-    input_tokens/output_tokens. Accept either.
+    Every API names these token counts differently:
+    - Chat Completions:    prompt_tokens / completion_tokens
+    - Responses API:       input_tokens / output_tokens
+    - Ollama (native):     prompt_eval_count / eval_count
+    Accept any of them.
     """
     if not usage:
         return None
-    return {
-        "input":  usage.get("prompt_tokens",     usage.get("input_tokens",  0)),
-        "output": usage.get("completion_tokens", usage.get("output_tokens", 0)),
-        "total":  usage.get("total_tokens", 0),
-    }
+    input_tok  = usage.get("prompt_tokens", usage.get("input_tokens", usage.get("prompt_eval_count", 0)))
+    output_tok = usage.get("completion_tokens", usage.get("output_tokens", usage.get("eval_count", 0)))
+    total_tok  = usage.get("total_tokens") or (input_tok + output_tok)
+    return {"input": input_tok, "output": output_tok, "total": total_tok}
 
 
 def _compute_cost(backend_cfg: dict, model: str, usage: dict):
@@ -565,6 +587,12 @@ def _extract_output(parsed):
     # convenience field some clients add, not guaranteed to be present.
     if "output" in parsed:
         return parsed.get("output_text") or parsed["output"]
+    # Ollama native: /api/chat replies with "message", /api/generate with
+    # a plain "response" string.
+    if "message" in parsed:
+        return parsed["message"]
+    if "response" in parsed:
+        return parsed["response"]
     return parsed
 
 
@@ -575,23 +603,29 @@ def _log(method, path, status, ms, model, service):
 
 def _parse_stream_buffer(full_bytes: bytes) -> tuple:
     """
-    Parse SSE stream buffer.
-    Returns (last_data_chunk_parsed, usage_dict_or_None).
-
-    Two shapes in play:
-    - Chat Completions: a bare {"usage": ..., "choices": [...]} chunk when
+    Parses a streamed response body regardless of which of these three
+    shapes it's actually in — the proxy doesn't know in advance which one
+    a given backend/endpoint uses:
+    - Chat Completions (SSE, "data: {...}" lines): a bare
+      {"usage": ..., "choices": [...]} chunk when
       stream_options.include_usage is set.
-    - Responses API: a sequence of typed events; the final one nests the
-      complete response (including usage) under a "response" key instead
-      of putting usage at the top level — no opt-in needed for it.
+    - Responses API (SSE, "data: {...}" lines): a sequence of typed
+      events; the final one nests the complete response — including
+      usage — under a "response" key instead of at the top level, with
+      no opt-in needed.
+    - Ollama native (NDJSON, no "data:" prefix — one raw JSON object per
+      line): the final line (done: true) carries prompt_eval_count /
+      eval_count and the assembled message directly at the top level.
+
+    Returns (last_relevant_chunk_parsed, usage_dict_or_None).
     """
     parsed     = None
     usage_data = None
     for line in full_bytes.decode(errors="ignore").splitlines():
         line = line.strip()
-        if not line.startswith("data:") or "[DONE]" in line:
+        if not line or "[DONE]" in line:
             continue
-        chunk_str = line[len("data:"):].strip()
+        chunk_str = line[len("data:"):].strip() if line.startswith("data:") else line
         try:
             chunk_json = json.loads(chunk_str)
         except Exception:
@@ -606,6 +640,10 @@ def _parse_stream_buffer(full_bytes: bytes) -> tuple:
                 usage_data = response_obj["usage"]
             if response_obj.get("output") is not None:
                 parsed = response_obj
+        if "prompt_eval_count" in chunk_json or "eval_count" in chunk_json:
+            usage_data = chunk_json
+        if "message" in chunk_json or ("response" in chunk_json and not isinstance(response_obj, dict)):
+            parsed = chunk_json
     return parsed, usage_data
 
 
@@ -643,19 +681,22 @@ async def proxy(backend: str, rest: str, request: Request, background_tasks: Bac
     headers = _fwd_headers(dict(request.headers), backend_cfg["api_key"])
     body_b  = await request.body()
     rest_key = rest.lstrip("/")
-    is_llm   = rest_key in LLM_ENDPOINTS
-    # The Responses API (POST /v1/responses) already includes usage on
-    # every stream's final event with no opt-in — unlike Chat Completions,
-    # it doesn't accept a "stream_options" field, so injecting one below
-    # would be rejected outright.
-    is_responses_api = rest_key in {"v1/responses", "responses"}
 
     body_j = {}
-    if body_b and is_llm:
+    if body_b:
         try:
             body_j = json.loads(body_b)
         except Exception:
             pass
+
+    # Trace anything that names a model, rather than matching a fixed list
+    # of known paths. Virtually every real inference API — Chat Completions,
+    # the Responses API, embeddings, Ollama's native /api/chat and
+    # /api/generate, an Anthropic-shaped /v1/messages, vLLM, whatever comes
+    # next — requires a "model" field somewhere in the request body,
+    # regardless of everything else about its shape. That's a far more
+    # durable signal than trying to enumerate every path in advance.
+    is_llm = bool(body_j.get("model"))
 
     # ── Non-LLM pass-through ──────────────────────────────────────────────────
     if not is_llm:
@@ -680,10 +721,12 @@ async def proxy(backend: str, rest: str, request: Request, background_tasks: Bac
 
     # ── Streaming ─────────────────────────────────────────────────────────────
     if is_stream:
-        if not is_responses_api:
+        if rest_key in CHAT_COMPLETIONS_STREAM_PATHS:
             # Ask the backend to include token usage in the final chunk.
-            # The Responses API always does this with no opt-in, and
-            # rejects unrecognized top-level fields like this one.
+            # Only done for paths known to accept this field — everything
+            # else (Responses API, Ollama native, anything unrecognized)
+            # either already includes usage with no opt-in, or might
+            # reject an unexpected top-level field outright.
             body_j["stream_options"] = {"include_usage": True}
             body_b = json.dumps(body_j).encode()
 
@@ -774,7 +817,7 @@ async def proxy(backend: str, rest: str, request: Request, background_tasks: Bac
 
                     level  = "ERROR" if r.status_code >= 400 else "DEFAULT"
                     output = _extract_output(parsed)
-                    usage  = _parse_usage(parsed.get("usage") if parsed else None)
+                    usage  = _parse_usage(_find_usage_dict(parsed))
                     cost   = _compute_cost(backend_cfg, model, usage)
 
                     gen_span.update(
