@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>LLM Proxy — Admin</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA2NCA2NCI+CjxkZWZzPjxsaW5lYXJHcmFkaWVudCBpZD0iZyIgeDE9IjAiIHkxPSIwIiB4Mj0iMSIgeTI9IjEiPgo8c3RvcCBvZmZzZXQ9IjAiIHN0b3AtY29sb3I9IiM0ZjZiZmEiLz48c3RvcCBvZmZzZXQ9IjEiIHN0b3AtY29sb3I9IiM5YjdiZmYiLz4KPC9saW5lYXJHcmFkaWVudD48L2RlZnM+CjxyZWN0IHdpZHRoPSI2NCIgaGVpZ2h0PSI2NCIgcng9IjE1IiBmaWxsPSJ1cmwoI2cpIi8+CjxnIHN0cm9rZT0iI2ZmZmZmZiIgc3Ryb2tlLXdpZHRoPSIzLjQiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCI+CjxsaW5lIHgxPSIzMiIgeTE9IjMyIiB4Mj0iMzIiIHkyPSIxMSIvPgo8bGluZSB4MT0iMzIiIHkxPSIzMiIgeDI9IjEzIiB5Mj0iNDgiLz4KPGxpbmUgeDE9IjMyIiB5MT0iMzIiIHgyPSI1MSIgeTI9IjQ4Ii8+CjwvZz4KPGNpcmNsZSBjeD0iMzIiIGN5PSIzMiIgcj0iNy41IiBmaWxsPSIjZmZmZmZmIi8+CjxjaXJjbGUgY3g9IjMyIiBjeT0iMTEiIHI9IjQuOCIgZmlsbD0iI2ZmZmZmZiIvPgo8Y2lyY2xlIGN4PSIxMyIgY3k9IjQ4IiByPSI0LjgiIGZpbGw9IiNmZmZmZmYiLz4KPGNpcmNsZSBjeD0iNTEiIGN5PSI0OCIgcj0iNC44IiBmaWxsPSIjZmZmZmZmIi8+Cjwvc3ZnPg==">
 <style>
   :root {
     color-scheme: light dark;
@@ -58,9 +59,14 @@
   * { box-sizing: border-box; }
   html { color-scheme: light dark; }
   body {
-    margin: 0; background: var(--bg); color: var(--text);
+    margin: 0; color: var(--text);
     min-height: 100vh; -webkit-font-smoothing: antialiased;
     transition: background .2s ease, color .2s ease;
+    background:
+      radial-gradient(560px circle at 12% -8%, color-mix(in srgb, var(--accent) 12%, transparent), transparent 60%),
+      radial-gradient(480px circle at 100% 0%, color-mix(in srgb, #9b7bff 10%, transparent), transparent 60%),
+      var(--bg);
+    background-attachment: fixed;
   }
   svg.icon { width: 16px; height: 16px; stroke: currentColor; fill: none; stroke-width: 1.8;
     stroke-linecap: round; stroke-linejoin: round; flex: none; vertical-align: -3px; }
@@ -273,7 +279,12 @@
 <header>
   <div class="brand">
     <div class="brand-mark">
-      <svg class="icon" viewBox="0 0 24 24"><path d="M4 6a8 4 0 0 1 16 0v12a8 4 0 0 1-16 0Z"/><path d="M4 6a8 4 0 0 0 16 0"/><path d="M4 12a8 4 0 0 0 16 0"/></svg>
+      <svg class="icon" viewBox="0 0 24 24" stroke="#fff" stroke-width="1.7" stroke-linecap="round">
+        <line x1="12" y1="12" x2="12" y2="4"/><line x1="12" y1="12" x2="5" y2="18"/><line x1="12" y1="12" x2="19" y2="18"/>
+        <circle cx="12" cy="12" r="2.6" fill="#fff" stroke="none"/>
+        <circle cx="12" cy="4" r="1.7" fill="#fff" stroke="none"/>
+        <circle cx="5" cy="18" r="1.7" fill="#fff" stroke="none"/><circle cx="19" cy="18" r="1.7" fill="#fff" stroke="none"/>
+      </svg>
     </div>
     <div class="brand-text">
       <h1>LLM Proxy</h1>
@@ -290,7 +301,12 @@
 
 <div class="token-gate">
   <div class="gate-mark">
-    <svg class="icon" viewBox="0 0 24 24"><rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/><circle cx="12" cy="15" r="1.4" fill="#fff" stroke="none"/></svg>
+    <svg class="icon" viewBox="0 0 24 24" stroke="#fff" stroke-width="1.6" stroke-linecap="round">
+      <line x1="12" y1="12" x2="12" y2="4"/><line x1="12" y1="12" x2="5" y2="18"/><line x1="12" y1="12" x2="19" y2="18"/>
+      <circle cx="12" cy="12" r="3" fill="#fff" stroke="none"/>
+      <circle cx="12" cy="4" r="1.9" fill="#fff" stroke="none"/>
+      <circle cx="5" cy="18" r="1.9" fill="#fff" stroke="none"/><circle cx="19" cy="18" r="1.9" fill="#fff" stroke="none"/>
+    </svg>
   </div>
   <h2>Unlock admin</h2>
   <p>Paste the admin token from this host's <code>.env</code> (<code>ADMIN_TOKEN</code>). It stays only in this browser's local storage.</p>
