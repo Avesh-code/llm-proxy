@@ -657,10 +657,19 @@ async def proxy(backend: str, rest: str, request: Request, background_tasks: Bac
         except Exception:
             pass
 
-    # ── Non-LLM pass-through ──────────────────────────────────────────────────
+    # ── Reject unsupported endpoints ─────────────────────────────────────────
+    # Only the paths this proxy actually knows how to trace are allowed
+    # through at all — e.g. /v1/completions and /v1/responses, not whatever
+    # else a backend happens to expose. A path outside that list gets a
+    # clean 400 instead of being silently forwarded untraced.
     if not is_llm:
-        r = await http_client.request(method=request.method, url=url, headers=headers, content=body_b)
-        return Response(content=r.content, status_code=r.status_code, headers=_resp_headers(r.headers))
+        _log(request.method, f"{backend}/{rest}", 400, 0, "-", team)
+        return JSONResponse(status_code=400, content={"error": {
+            "message": f"'/{rest}' is not a supported endpoint on this proxy. "
+                       f"Supported: {sorted(LLM_ENDPOINTS)}",
+            "type":    "invalid_request_error",
+            "code":    "unsupported_endpoint",
+        }})
 
     # ── LLM path ──────────────────────────────────────────────────────────────
     model      = body_j.get("model", "unknown")

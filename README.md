@@ -39,6 +39,11 @@ no redeploys to onboard a team or add a model server.
   Nothing is inferred from the `model` field — real model ids (e.g.
   `meta-llama/Llama-3-70b`) can themselves contain a `/`, so path-based
   routing is what stays unambiguous as you add more backends.
+- **Only known LLM endpoints are allowed through at all.** `v1/chat/completions`,
+  `v1/completions`, `v1/responses` (and their unprefixed variants) — anything
+  else gets a `400` instead of being silently forwarded untraced. This is a
+  proxy for LLM inference calls specifically, not a general-purpose reverse
+  proxy for whatever else a backend happens to expose.
 - **Auth is per team, not per backend.** A team's bearer token is checked
   against an allow-list of backend names; a team with no access to a backend
   gets a `403`, not a proxied request. Backends never see a team's token —
@@ -158,7 +163,7 @@ isn't lost on `docker compose up -d --force-recreate` or an image rebuild.
 
 | Endpoint | Auth | Purpose |
 |---|---|---|
-| `POST/GET/... /<backend>/<path>` | team token | The actual proxy. Forwards to `<backend>`'s `base_url + /<path>`. `chat/completions`-shaped calls are traced to that team's Langfuse project; everything else passes through untraced. |
+| `POST/GET/... /<backend>/<path>` | team token | The actual proxy. Forwards to `<backend>`'s `base_url + /<path>` and traces it to that team's Langfuse project. Only known LLM-shaped paths are allowed — `v1/chat/completions`, `v1/completions`, `v1/responses` (and their unprefixed variants); anything else gets a `400`, not a silent untraced forward. |
 | `GET /whoami` | team token | This team's allowed backends, their models, and a ready-to-run curl example. |
 | `GET /v1/models`, `GET /models` | team token | OpenAI-style model list, filtered to what this team's token can reach, including each model's `input_price_per_1m`/`output_price_per_1m`. |
 | `GET /health` | none | Liveness + a non-secret summary: backend names/types/models, team names/allowed-backends/tracing-on-off, `public_base_url`. |
@@ -290,6 +295,13 @@ team's row, or `GET /whoami` with its token.
 
 **A team gets `404`** — the `backend` segment in the URL doesn't match any
 configured backend name. Check `/admin` → Backends, or `GET /health`.
+
+**A team gets `400 unsupported_endpoint`** — the path after the backend
+name isn't one this proxy traces (`v1/chat/completions`, `v1/completions`,
+`v1/responses`, or their unprefixed variants). This is intentional: the
+proxy only fronts LLM inference calls, not arbitrary paths a backend
+happens to expose. If a legitimate LLM API shape is missing from that list,
+it needs to be added in code (`LLM_ENDPOINTS` in `proxy.py`).
 
 **"Test connection" fails in the admin UI** — the proxy container needs
 network access to that backend's `base_url`. If the backend is on the same
