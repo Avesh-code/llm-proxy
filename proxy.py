@@ -248,6 +248,7 @@ app = FastAPI(lifespan=lifespan)
 LLM_ENDPOINTS = {
     "v1/chat/completions", "v1/completions",
     "chat/completions",    "completions",
+    "v1/responses",        "responses",
 }
 
 RESERVED_BACKEND_NAMES = {"admin", "health", "whoami", "v1", "models"}
@@ -511,12 +512,17 @@ def _resp_headers(h) -> dict:
 
 
 def _parse_usage(usage):
+    """
+    Chat Completions names these prompt_tokens/completion_tokens; the newer
+    Responses API (POST /v1/responses) names the same two things
+    input_tokens/output_tokens. Accept either.
+    """
     if not usage:
         return None
     return {
-        "input":  usage.get("prompt_tokens",     0),
-        "output": usage.get("completion_tokens", 0),
-        "total":  usage.get("total_tokens",      0),
+        "input":  usage.get("prompt_tokens",     usage.get("input_tokens",  0)),
+        "output": usage.get("completion_tokens", usage.get("output_tokens", 0)),
+        "total":  usage.get("total_tokens", 0),
     }
 
 
@@ -554,6 +560,11 @@ def _extract_output(parsed):
     choices = parsed.get("choices")
     if choices:
         return choices[0].get("message") or choices[0].get("delta") or parsed
+    # Responses API: no "choices" — "output" is a list of items (messages,
+    # tool calls, reasoning blocks, ...); "output_text" is a plain-text
+    # convenience field some clients add, not guaranteed to be present.
+    if "output" in parsed:
+        return parsed.get("output_text") or parsed["output"]
     return parsed
 
 
@@ -566,8 +577,13 @@ def _parse_stream_buffer(full_bytes: bytes) -> tuple:
     """
     Parse SSE stream buffer.
     Returns (last_data_chunk_parsed, usage_dict_or_None).
-    OpenAI-compatible backends send usage in a final chunk when
-    stream_options.include_usage is set.
+
+    Two shapes in play:
+    - Chat Completions: a bare {"usage": ..., "choices": [...]} chunk when
+      stream_options.include_usage is set.
+    - Responses API: a sequence of typed events; the final one nests the
+      complete response (including usage) under a "response" key instead
+      of putting usage at the top level — no opt-in needed for it.
     """
     parsed     = None
     usage_data = None
@@ -578,12 +594,18 @@ def _parse_stream_buffer(full_bytes: bytes) -> tuple:
         chunk_str = line[len("data:"):].strip()
         try:
             chunk_json = json.loads(chunk_str)
-            if chunk_json.get("usage"):
-                usage_data = chunk_json["usage"]
-            if chunk_json.get("choices"):
-                parsed = chunk_json
         except Exception:
-            pass
+            continue
+        if chunk_json.get("usage"):
+            usage_data = chunk_json["usage"]
+        if chunk_json.get("choices"):
+            parsed = chunk_json
+        response_obj = chunk_json.get("response")
+        if isinstance(response_obj, dict):
+            if response_obj.get("usage"):
+                usage_data = response_obj["usage"]
+            if response_obj.get("output") is not None:
+                parsed = response_obj
     return parsed, usage_data
 
 
@@ -620,7 +642,13 @@ async def proxy(backend: str, rest: str, request: Request, background_tasks: Bac
     url     = f"{backend_cfg['base_url']}/{rest}"
     headers = _fwd_headers(dict(request.headers), backend_cfg["api_key"])
     body_b  = await request.body()
-    is_llm  = rest.lstrip("/") in LLM_ENDPOINTS
+    rest_key = rest.lstrip("/")
+    is_llm   = rest_key in LLM_ENDPOINTS
+    # The Responses API (POST /v1/responses) already includes usage on
+    # every stream's final event with no opt-in — unlike Chat Completions,
+    # it doesn't accept a "stream_options" field, so injecting one below
+    # would be rejected outright.
+    is_responses_api = rest_key in {"v1/responses", "responses"}
 
     body_j = {}
     if body_b and is_llm:
@@ -636,7 +664,9 @@ async def proxy(backend: str, rest: str, request: Request, background_tasks: Bac
 
     # ── LLM path ──────────────────────────────────────────────────────────────
     model      = body_j.get("model", "unknown")
-    messages   = body_j.get("messages")
+    # Chat Completions sends "messages"; the Responses API sends "input"
+    # (a string or a list of role/content items) and no "messages" at all.
+    messages   = body_j.get("messages") or body_j.get("input") or body_j.get("prompt")
     trace_name = request.headers.get("x-trace-name") or model or "llm-request"
     user_id    = request.headers.get("x-user-id") or None
     # Derived from the validated token, so a client cannot spoof it.
@@ -650,9 +680,12 @@ async def proxy(backend: str, rest: str, request: Request, background_tasks: Bac
 
     # ── Streaming ─────────────────────────────────────────────────────────────
     if is_stream:
-        # Ask the backend to include token usage in the final chunk.
-        body_j["stream_options"] = {"include_usage": True}
-        body_b = json.dumps(body_j).encode()
+        if not is_responses_api:
+            # Ask the backend to include token usage in the final chunk.
+            # The Responses API always does this with no opt-in, and
+            # rejects unrecognized top-level fields like this one.
+            body_j["stream_options"] = {"include_usage": True}
+            body_b = json.dumps(body_j).encode()
 
         collected = []
         err_box   = [None]
@@ -661,7 +694,7 @@ async def proxy(backend: str, rest: str, request: Request, background_tasks: Bac
             with langfuse.start_as_current_observation(
                 as_type  = "span",
                 name     = trace_name,
-                input    = messages or body_j.get("prompt"),
+                input    = messages,
                 metadata = {"path": f"/{backend}/{rest}", "model": model, "backend": backend, "service": service},
             ) as root_span:
                 with langfuse.start_as_current_observation(
@@ -714,7 +747,7 @@ async def proxy(backend: str, rest: str, request: Request, background_tasks: Bac
         with langfuse.start_as_current_observation(
             as_type  = "span",
             name     = trace_name,
-            input    = messages or body_j.get("prompt"),
+            input    = messages,
             metadata = {"path": f"/{backend}/{rest}", "model": model, "backend": backend, "service": service},
         ) as root_span:
             with langfuse.start_as_current_observation(
