@@ -27,6 +27,12 @@ LEGACY_YAML_PATH = os.getenv("CONFIG_PATH",           "backends.yaml")
 # only works if a reverse proxy is correctly forwarding X-Forwarded-Proto/Host.
 # Leave unset to fall back to that header-based guess (fine for local/direct use).
 PUBLIC_BASE_URL  = os.getenv("PUBLIC_BASE_URL",       "").rstrip("/")
+# Default cap on concurrent in-flight requests to a single backend, used
+# whenever a backend doesn't specify its own max_concurrency. The shared
+# httpx connection pool (see http_client below) has no per-backend
+# awareness on its own, so without this a burst to one backend can starve
+# every other backend and team of connections too.
+DEFAULT_BACKEND_CONCURRENCY = 20
 
 # Legacy env vars — read once, only to seed data/config.json on first boot.
 # After that file exists, these are ignored; edit backends/teams/tracing via
@@ -70,6 +76,7 @@ class ConfigStore:
                 m if isinstance(m, dict) else {"id": m, "input_price": 0.0, "output_price": 0.0}
                 for m in cfg.get("models", [])
             ]
+            cfg.setdefault("max_concurrency", DEFAULT_BACKEND_CONCURRENCY)
         return data
 
     def _migrate_from_yaml(self, legacy_yaml_path: str) -> dict:
@@ -92,11 +99,12 @@ class ConfigStore:
         for name, cfg in (raw.get("backends") or {}).items():
             api_key_env = cfg.get("api_key_env") or ""
             data["backends"][name] = {
-                "type":     cfg.get("type", "openai"),
-                "base_url": cfg["base_url"].rstrip("/"),
-                "api_key":  os.getenv(api_key_env, "") if api_key_env else "",
-                "models":   [{"id": m, "input_price": 0.0, "output_price": 0.0}
-                             for m in (cfg.get("models") or [])],
+                "type":            cfg.get("type", "openai"),
+                "base_url":        cfg["base_url"].rstrip("/"),
+                "api_key":         os.getenv(api_key_env, "") if api_key_env else "",
+                "models":          [{"id": m, "input_price": 0.0, "output_price": 0.0}
+                                    for m in (cfg.get("models") or [])],
+                "max_concurrency": cfg.get("max_concurrency") or DEFAULT_BACKEND_CONCURRENCY,
             }
         for name, cfg in (raw.get("teams") or {}).items():
             token_env = cfg.get("token_env")
@@ -140,6 +148,27 @@ def _rebuild_indexes():
 
 
 _rebuild_indexes()
+
+# ── Per-backend concurrency limiting ─────────────────────────────────────────
+# Each backend gets its own asyncio.Semaphore capping how many requests can
+# be actively in flight to it at once; requests beyond that limit simply
+# wait their turn rather than being rejected. A semaphore's limit is fixed
+# at construction, so a backend gets a fresh one any time its config is
+# saved (including just to change the limit) — see _rebuild_backend_semaphore.
+_BACKEND_SEMAPHORES: dict = {}
+
+
+def _rebuild_backend_semaphore(name: str):
+    limit = BACKENDS.get(name, {}).get("max_concurrency") or DEFAULT_BACKEND_CONCURRENCY
+    _BACKEND_SEMAPHORES[name] = asyncio.Semaphore(limit)
+
+
+def _backend_semaphore(name: str) -> asyncio.Semaphore:
+    return _BACKEND_SEMAPHORES.setdefault(name, asyncio.Semaphore(DEFAULT_BACKEND_CONCURRENCY))
+
+
+for _backend_name in BACKENDS:
+    _rebuild_backend_semaphore(_backend_name)
 
 
 def _presented_token(request: Request) -> str:
@@ -366,6 +395,7 @@ class BackendIn(BaseModel):
     base_url: str
     api_key: str = ""           # PUT with "" on an existing backend keeps the current key
     models: list[ModelPriceIn] = []
+    max_concurrency: int = DEFAULT_BACKEND_CONCURRENCY  # cap on requests in flight to this backend at once
 
 
 class TeamIn(BaseModel):
@@ -389,13 +419,15 @@ async def admin_upsert_backend(name: str, body: BackendIn):
         raise HTTPException(status_code=400, detail=f"invalid or reserved backend name '{name}'")
     existing = store.data["backends"].get(name, {})
     store.data["backends"][name] = {
-        "type":     body.type,
-        "base_url": body.base_url.rstrip("/"),
-        "api_key":  body.api_key or existing.get("api_key", ""),
-        "models":   [m.model_dump() for m in body.models],
+        "type":            body.type,
+        "base_url":        body.base_url.rstrip("/"),
+        "api_key":         body.api_key or existing.get("api_key", ""),
+        "models":          [m.model_dump() for m in body.models],
+        "max_concurrency": body.max_concurrency or DEFAULT_BACKEND_CONCURRENCY,
     }
     await store.save()
     _rebuild_indexes()
+    _rebuild_backend_semaphore(name)
     return {"ok": True, "name": name}
 
 
@@ -409,6 +441,7 @@ async def admin_delete_backend(name: str):
     del store.data["backends"][name]
     await store.save()
     _rebuild_indexes()
+    _BACKEND_SEMAPHORES.pop(name, None)
     return {"ok": True}
 
 
@@ -738,12 +771,16 @@ async def proxy(backend: str, rest: str, request: Request, background_tasks: Bac
 
         async def stream_gen():
             try:
-                async with http_client.stream(
-                    method=request.method, url=url, headers=headers, content=body_b
-                ) as r:
-                    async for chunk in r.aiter_bytes():
-                        collected.append(chunk)
-                        yield chunk
+                # Held for the whole streamed call, not just the connect —
+                # a slow backend keeps its slot occupied for as long as it's
+                # actually generating, which is the point of the limit.
+                async with _backend_semaphore(backend):
+                    async with http_client.stream(
+                        method=request.method, url=url, headers=headers, content=body_b
+                    ) as r:
+                        async for chunk in r.aiter_bytes():
+                            collected.append(chunk)
+                            yield chunk
             except Exception as e:
                 err_box[0] = str(e)
                 raise
@@ -792,9 +829,10 @@ async def proxy(backend: str, rest: str, request: Request, background_tasks: Bac
                 },
             ) as gen_span:
                 try:
-                    r      = await http_client.request(
-                        method=request.method, url=url, headers=headers, content=body_b
-                    )
+                    async with _backend_semaphore(backend):
+                        r = await http_client.request(
+                            method=request.method, url=url, headers=headers, content=body_b
+                        )
                     ms     = int((time.time() - start_ms) * 1000)
                     parsed = None
                     try:

@@ -44,6 +44,11 @@ no redeploys to onboard a team or add a model server.
   else gets a `400` instead of being silently forwarded untraced. This is a
   proxy for LLM inference calls specifically, not a general-purpose reverse
   proxy for whatever else a backend happens to expose.
+- **Concurrency is capped per backend.** Each backend has a "max concurrent
+  requests" limit (set in `/admin`, default 20) enforced with an
+  `asyncio.Semaphore` — a burst of traffic to one backend queues past that
+  limit instead of eating the whole shared connection pool and slowing down
+  every other backend and team too.
 - **Auth is per team, not per backend.** A team's bearer token is checked
   against an allow-list of backend names; a team with no access to a backend
   gets a `403`, not a proxied request. Backends never see a team's token —
@@ -168,7 +173,7 @@ isn't lost on `docker compose up -d --force-recreate` or an image rebuild.
 | `GET /v1/models`, `GET /models` | team token | OpenAI-style model list, filtered to what this team's token can reach, including each model's `input_price_per_1m`/`output_price_per_1m`. |
 | `GET /health` | none | Liveness + a non-secret summary: backend names/types/models, team names/allowed-backends/tracing-on-off, `public_base_url`. |
 | `GET /admin` | none (page is static; its API calls are gated) | The admin UI. |
-| `GET/PUT/DELETE /admin/api/backends[/{name}]` | admin token | Manage backends. `PUT` upserts (create or update); an empty `api_key` on update keeps the existing one. |
+| `GET/PUT/DELETE /admin/api/backends[/{name}]` | admin token | Manage backends. `PUT` upserts (create or update); an empty `api_key` on update keeps the existing one. `max_concurrency` (default 20) caps requests in flight to that backend at once. |
 | `POST /admin/api/backends/{name}/test` | admin token | Probes a backend with its own model-listing route (`GET /v1/models` for OpenAI/vLLM/generic, `GET /api/tags` for Ollama) and returns what it finds. |
 | `GET/PUT/DELETE /admin/api/teams[/{name}]` | admin token | Manage teams. `PUT` upserts; blank `token` auto-generates one; blank `langfuse_secret_key` on update keeps the existing one. Deleting a backend still referenced by a team is refused (`409`) — remove it from the team(s) first. |
 

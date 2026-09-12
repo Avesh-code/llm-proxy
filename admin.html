@@ -394,6 +394,8 @@
             </button>
             <span class="field-hint" id="bf-test-result"></span>
           </div>
+          <label>Max concurrent requests <span class="field-hint">how many requests may be in flight to this backend at once — extra requests wait their turn instead of piling onto it</span></label>
+          <input type="text" inputmode="numeric" id="bf-max-concurrency" placeholder="20" style="max-width:120px">
           <div class="divider"></div>
           <div style="display:flex; justify-content:flex-end; gap:8px">
             <button type="button" onclick="closeBackendForm()">Cancel</button>
@@ -600,11 +602,13 @@ function openBackendForm(name) {
     document.getElementById('bf-base-url').value = b.base_url;
     document.getElementById('bf-models').value = formatModelsText(b.models);
     document.getElementById('bf-key-hint').textContent = b.api_key ? `(currently set: ${b.api_key})` : '(none set)';
+    document.getElementById('bf-max-concurrency').value = b.max_concurrency || 20;
   } else {
     document.getElementById('backend-form-title').textContent = 'Add backend';
     document.getElementById('bf-original-name').value = '';
     document.getElementById('bf-name').disabled = false;
     document.getElementById('bf-key-hint').textContent = '';
+    document.getElementById('bf-max-concurrency').value = 20;
   }
   document.getElementById('backend-form-card').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 }
@@ -635,6 +639,7 @@ function currentBackendFormValue() {
     base_url: document.getElementById('bf-base-url').value.trim(),
     api_key: document.getElementById('bf-api-key').value,
     models: parseModelsText(document.getElementById('bf-models').value),
+    max_concurrency: parseInt(document.getElementById('bf-max-concurrency').value, 10) || 20,
   };
 }
 
