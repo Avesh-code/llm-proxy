@@ -459,11 +459,20 @@ async def admin_upsert_team(name: str, body: TeamIn):
     existing    = store.data["teams"].get(name, {})
     existing_lf = existing.get("langfuse", {})
     token       = body.token or existing.get("token") or secrets.token_hex(24)
+    # Blank public_key/secret_key on an update means "keep the current
+    # value" (same convention as a blank token or backend api_key) — a
+    # caller updating just one field (e.g. only the host, via a direct API
+    # call rather than the admin UI, which always resends the full form)
+    # must not silently wipe the others. host has no such fallback: an
+    # explicitly blank host is the deliberate way to disable tracing
+    # without discarding the keys, so it can be turned back on later by
+    # setting the host again alone.
+    public_key  = body.langfuse_public_key or existing_lf.get("public_key", "")
     secret_key  = body.langfuse_secret_key or existing_lf.get("secret_key", "")
     langfuse_cfg = {
-        "enabled":    bool(body.langfuse_host and body.langfuse_public_key and secret_key),
+        "enabled":    bool(body.langfuse_host and public_key and secret_key),
         "host":       body.langfuse_host,
-        "public_key": body.langfuse_public_key,
+        "public_key": public_key,
         "secret_key": secret_key,
     }
     store.data["teams"][name] = {"token": token, "backends": body.backends, "langfuse": langfuse_cfg}
