@@ -18,17 +18,16 @@ services:
 
     environment:
       # Re-declared so `docker compose config` shows what is actually in play.
-      # Backends/teams/tracing themselves live in data/config.json, managed
-      # from /admin — LANGFUSE_* here is only a one-time seed for it on the
-      # very first boot.
-      ADMIN_TOKEN:         ${ADMIN_TOKEN:?set ADMIN_TOKEN in .env — this guards the /admin UI}
-      PUBLIC_BASE_URL:     ${PUBLIC_BASE_URL:-}
-      LANGFUSE_HOST:       ${LANGFUSE_HOST:-}
-      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
-      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
-      CONFIG_PATH:         ${CONFIG_PATH:-backends.yaml}
-      PROXY_PORT:          4000
-      PROXY_TIMEOUT:       ${PROXY_TIMEOUT:-600}
+      # Backends/teams/the Phoenix connection itself live in data/config.json,
+      # managed from /admin — PHOENIX_* here is only a one-time seed for it
+      # on the very first boot.
+      ADMIN_TOKEN:                ${ADMIN_TOKEN:?set ADMIN_TOKEN in .env — this guards the /admin UI}
+      PUBLIC_BASE_URL:            ${PUBLIC_BASE_URL:-}
+      PHOENIX_COLLECTOR_ENDPOINT: ${PHOENIX_COLLECTOR_ENDPOINT:-}
+      PHOENIX_API_KEY:            ${PHOENIX_API_KEY:-}
+      CONFIG_PATH:                ${CONFIG_PATH:-backends.yaml}
+      PROXY_PORT:                 4000
+      PROXY_TIMEOUT:              ${PROXY_TIMEOUT:-600}
 
     # Persists data/config.json (backends, teams, tracing settings saved via
     # the admin UI) across `docker compose up -d --force-recreate` / image

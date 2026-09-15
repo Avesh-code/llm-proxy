@@ -2,9 +2,9 @@
 
 A single, self-hosted entry point for every LLM your org uses — OpenAI, vLLM,
 Ollama, or anything else that speaks the OpenAI API. Each team gets its own
-bearer token, its own allow-list of backends, and its own Langfuse project
-for tracing. Backends and teams are managed live from a built-in admin UI —
-no redeploys to onboard a team or add a model server.  
+bearer token, its own allow-list of backends, and its own Arize Phoenix
+project for tracing. Backends and teams are managed live from a built-in
+admin UI — no redeploys to onboard a team or add a model server.  
 
 ![Architecture](proxy-architecture.png)  
 
@@ -15,7 +15,7 @@ no redeploys to onboard a team or add a model server.
                                │            └──►  Ollama (self-hosted)
                                │
                                ├─► /admin        add backends & teams, no restart
-                               └─► Langfuse       one project per team
+                               └─► Arize Phoenix  one project per team, one shared API key
 ```
 
 ## Contents
@@ -54,19 +54,22 @@ no redeploys to onboard a team or add a model server.
   gets a `403`, not a proxied request. Backends never see a team's token —
   the proxy swaps in that backend's own API key (or none, for a keyless
   Ollama/vLLM server) before forwarding.
-- **Config is live, not baked into the image.** Backends, teams, and each
-  team's Langfuse keys live in `data/config.json`, managed entirely through
-  `/admin`. Editing them takes effect immediately — no container restart.
-- **Tracing is per team.** Every `chat/completions` call is traced into
-  *that team's own* Langfuse project (model, input/output, token usage,
-  latency, tagged by backend). A team with no Langfuse keys configured just
-  runs untraced — nothing else has to know or care.
-- **Cost is computed by the proxy, not guessed by Langfuse.** Langfuse only
-  auto-prices models it recognizes by name, so a self-hosted model, a custom
-  fine-tune, or anything it doesn't know shows up as a flat $0. Set a price
-  per model in `/admin` and the proxy computes real cost from the token
-  usage in the backend's own response and forwards it explicitly — see
-  [Cost tracking](#cost-tracking).
+- **Config is live, not baked into the image.** Backends, teams, and the
+  global tracing connection live in `data/config.json`, managed entirely
+  through `/admin`. Editing them takes effect immediately — no container
+  restart.
+- **Tracing is per team, on one shared Phoenix connection.** One Arize
+  Phoenix instance and one System API Key (set once, globally, at `/admin`
+  → Settings) serve every team — each team's calls trace into *its own*
+  Phoenix project, named after the team by default, with zero per-team key
+  management. A team with tracing switched off just runs untraced —
+  nothing else has to know or care.
+- **Cost is computed by the proxy, not guessed by the tracing backend.**
+  Phoenix has no way to know the price of a self-hosted model, a custom
+  fine-tune, or anything without a public price list — those show up with
+  real token counts but no cost. Set a price per model in `/admin` and the
+  proxy computes real cost from the token usage in the backend's own
+  response and forwards it explicitly — see [Cost tracking](#cost-tracking).
 
 ## Quick start
 
@@ -94,9 +97,12 @@ Open `http://<this-host>:4000/admin` and paste in `ADMIN_TOKEN`. From there:
    one), then hit **Test connection & fetch models** to pull its live model
    list instead of typing it by hand.
 2. **Teams → Add team** — name it, tick which backends it may call. Leave the
-   token blank to auto-generate one. Optionally fill in that team's Langfuse
-   host/public key/secret key right there to turn on tracing for it.
-3. Hand the team its token (visible on its row, with a copy button) and point
+   token blank to auto-generate one. Tracing is on by default and needs
+   nothing else here — it uses the one Phoenix connection from **Settings**
+   and traces into a project named after the team automatically.
+3. **Settings** — set the Phoenix endpoint and System API Key once, for
+   every team (see [Tracing](#tracing)).
+4. Hand the team its token (visible on its row, with a copy button) and point
    them at [Onboarding a team](#onboarding-a-team) below.
 
 No backends or teams ship pre-configured — `backends.yaml` only holds
@@ -144,7 +150,8 @@ committed — `.env` is gitignored.
 | `PUBLIC_BASE_URL` | no | — | The domain teams actually use, e.g. `https://llm.company.com`. Used verbatim in `/whoami`'s curl examples and the admin UI's, instead of guessing from request headers. Set this once you have a real domain. |
 | `CONFIG_DATA_PATH` | no | `data/config.json` | Where the live backend/team/tracing config is persisted. Mounted as a volume in `docker-compose.yml` so it survives container recreation. |
 | `CONFIG_PATH` | no | `backends.yaml` | One-time migration seed, read **only** if `CONFIG_DATA_PATH` doesn't exist yet. |
-| `OPENAI_API_KEY`, `LANGFUSE_HOST`, `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, `TOKEN_TEAM_*`, … | no | — | Only consulted during that one-time migration, to seed backends/teams that `backends.yaml` names with `api_key_env` / `token_env`. Irrelevant once `data/config.json` exists — use `/admin` instead. |
+| `PHOENIX_COLLECTOR_ENDPOINT`, `PHOENIX_API_KEY` | no | — | Seeds the one global Phoenix connection on first boot only. After that, edit it live at `/admin` → Settings — these vars are then ignored. |
+| `OPENAI_API_KEY`, `TOKEN_TEAM_*`, … | no | — | Only consulted during that one-time migration, to seed backends/teams that `backends.yaml` names with `api_key_env` / `token_env`. Irrelevant once `data/config.json` exists — use `/admin` instead. |
 
 ### `backends.yaml`
 
@@ -159,8 +166,9 @@ scratch at any point: delete `data/config.json` and restart.
 ### `data/config.json`
 
 The actual runtime state — every backend (base URL, type, API key, model
-list) and every team (token, allowed backends, Langfuse keys) — written by
-the admin API. Treat it like `.env`: it contains real secrets, it's
+list), every team (token, allowed backends, tracing on/off, project name),
+and the one global Phoenix connection (endpoint, System API Key) — written
+by the admin API. Treat it like `.env`: it contains real secrets, it's
 gitignored, and in Docker it lives on the `proxy-data` named volume so it
 isn't lost on `docker compose up -d --force-recreate` or an image rebuild.
 
@@ -168,47 +176,65 @@ isn't lost on `docker compose up -d --force-recreate` or an image rebuild.
 
 | Endpoint | Auth | Purpose |
 |---|---|---|
-| `POST/GET/... /<backend>/<path>` | team token | The actual proxy. Forwards to `<backend>`'s `base_url + /<path>` and traces it to that team's Langfuse project. Only known LLM-shaped paths are allowed — `v1/chat/completions`, `v1/completions`, `v1/responses` (and their unprefixed variants); anything else gets a `400`, not a silent untraced forward. |
+| `POST/GET/... /<backend>/<path>` | team token | The actual proxy. Forwards to `<backend>`'s `base_url + /<path>` and traces it to that team's Phoenix project. Only known LLM-shaped paths are allowed — `v1/chat/completions`, `v1/completions`, `v1/responses` (and their unprefixed variants); anything else gets a `400`, not a silent untraced forward. |
 | `GET /whoami` | team token | This team's allowed backends, their models, and a ready-to-run curl example. |
 | `GET /v1/models`, `GET /models` | team token | OpenAI-style model list, filtered to what this team's token can reach, including each model's `input_price_per_1m`/`output_price_per_1m`. |
 | `GET /health` | none | Liveness + a non-secret summary: backend names/types/models, team names/allowed-backends/tracing-on-off, `public_base_url`. |
 | `GET /admin` | none (page is static; its API calls are gated) | The admin UI. |
 | `GET/PUT/DELETE /admin/api/backends[/{name}]` | admin token | Manage backends. `PUT` upserts (create or update); an empty `api_key` on update keeps the existing one. `max_concurrency` (default 20) caps requests in flight to that backend at once. |
 | `POST /admin/api/backends/{name}/test` | admin token | Probes a backend with its own model-listing route (`GET /v1/models` for OpenAI/vLLM/generic, `GET /api/tags` for Ollama) and returns what it finds. |
-| `GET/PUT/DELETE /admin/api/teams[/{name}]` | admin token | Manage teams. `PUT` upserts; blank `token` auto-generates one; blank `langfuse_secret_key` on update keeps the existing one. Deleting a backend still referenced by a team is refused (`409`) — remove it from the team(s) first. |
+| `GET/PUT/DELETE /admin/api/teams[/{name}]` | admin token | Manage teams. `PUT` upserts; blank `token` auto-generates one. `tracing_enabled` (default `true`) and `project_name` (default: the team's own name) control that team's Phoenix project. Deleting a backend still referenced by a team is refused (`409`) — remove it from the team(s) first. |
+| `GET/PUT /admin/api/settings/phoenix` | admin token | The one global Phoenix connection (`endpoint`, `api_key`) shared by every team. `PUT` with a blank `api_key` keeps the current one. Changing either rebuilds every team's tracer immediately. |
 
 Bearer tokens are compared with a constant-time check (`hmac.compare_digest`)
 so a near-miss guess doesn't leak timing information.
 
 ## Tracing
 
-Tracing is Langfuse, configured **per team**, not globally. On a team's card
-in `/admin` → Teams, fill in:
+Tracing is [Arize Phoenix](https://github.com/Arize-ai/phoenix), sent over
+OTLP using [OpenInference](https://github.com/Arize-ai/openinference)
+semantic conventions (`openinference.span.kind=LLM`, `llm.model_name`,
+`llm.token_count.*`, `llm.cost.*`, `input.value`/`output.value`, …) — the
+same schema Phoenix's own instrumentation libraries produce, so its UI
+renders these spans natively.
 
-- **Langfuse host** — e.g. `https://cloud.langfuse.com` or your self-hosted URL
-- **Public key** / **Secret key** — from that team's Langfuse project
+Unlike the classic per-project-key-pair model, Phoenix authenticates with
+one instance-wide **System API Key** that can write to every project on
+that instance. That maps onto exactly one global setting for this whole
+proxy, not one per team:
 
-Every `chat/completions` request from that team then traces into that
-project: model, input/output, token usage, latency, tagged by model and
-backend. Leave any of the three blank and that team simply runs untraced —
-nothing else needs to change, since a team with no keys gets a Langfuse
-client built with `tracing_enabled=False`, which no-ops every trace call
-rather than needing a separate code path.
+**`/admin` → Settings** (once, for the whole proxy):
+- **Phoenix endpoint** — e.g. `https://phoenix.company.com`
+- **System API Key** — generate it in Phoenix under Settings → API Keys.
+  It must be a **System** key, not a personal **User** key — a System key
+  isn't tied to one admin's account and is meant for exactly this kind of
+  automated, programmatic use.
 
-There's no global tracing switch by design: since each team owns its own
-project, there's nothing meaningful for a proxy-wide toggle to control.
+**`/admin` → Teams → that team's card** (per team, and it's just two fields):
+- **Tracing enabled** — on by default
+- **Project name** — blank uses the team's own name
+
+Every `chat/completions` request from a team then traces into *that team's*
+Phoenix project — model, input/output, token usage, latency, cost — with no
+per-team key to manage. Turn tracing off for a team (or leave the global
+endpoint/key blank) and that team's tracer is a genuine OpenTelemetry
+no-op: every span call on it does nothing, so nothing else in the request
+path needs a separate code branch for "tracing is off."
+
+There's no per-team key rotation story anymore either: rotate the one
+System API Key at `/admin` → Settings and every team's tracer picks it up
+immediately, no restart, no re-entering anything per team.
 
 ## Cost tracking
 
-Langfuse prices a generation by matching its `model` name against its own
-built-in price list. That works fine for `gpt-4o`. It does nothing for a
-self-hosted vLLM/Ollama model, a fine-tune, or any model id Langfuse simply
-doesn't recognize — those all show a flat **$0**, token usage and all,
-because there's no per-token price for Langfuse to multiply against.
+There's no public price list Phoenix (or anything else) could look up for a
+self-hosted vLLM/Ollama model, a custom fine-tune, or a brand-new model id —
+those show up with correct token counts but no cost anywhere, because
+nothing in the pipeline knows the price per token.
 
-The proxy fixes this by owning pricing itself instead of leaving it to
-Langfuse's lookup. On a backend's card in `/admin`, the **Models** field
-takes one model per line:
+The proxy fixes this by owning pricing itself and forwarding it explicitly
+as `llm.cost.prompt`/`llm.cost.completion`/`llm.cost.total` on the span. On
+a backend's card in `/admin`, the **Models** field takes one model per line:
 
 ```
 gpt-4o
@@ -216,22 +242,21 @@ gpt-5.6-luna, 5, 15
 llama3
 ```
 
-- `gpt-4o` — no price given. Langfuse already knows how to price this one
-  correctly, so the proxy doesn't interfere.
-- `gpt-5.6-luna, 5, 15` — a model Langfuse can't price on its own. `5` and
-  `15` are USD per 1,000,000 input/output tokens. On every request, the
-  proxy takes the token counts straight from that backend's own response
-  and computes the real cost, forwarding it to Langfuse as an explicit
-  override instead of letting the lookup silently fail to $0.
+- `gpt-4o` — no price given. If your Phoenix setup already has pricing
+  configured for it, this doesn't interfere with that.
+- `gpt-5.6-luna, 5, 15` — a model with no price anywhere else. `5` and `15`
+  are USD per 1,000,000 input/output tokens. On every request, the proxy
+  takes the token counts straight from that backend's own response and
+  computes the real cost.
 - `llama3` — no price, self-hosted. Genuinely free, so leaving it blank is
-  correct; nothing gets overridden.
+  correct; no cost attribute is sent at all.
 
 The rule the proxy actually applies (`_compute_cost` in `proxy.py`): if a
 model has at least one non-zero price configured, its cost is computed from
-that price and forwarded explicitly; otherwise the proxy sends nothing and
-Langfuse falls back to its own lookup exactly as before. So filling in a
-price only ever fixes a model that was showing $0 — it never overrides a
-model Langfuse was already pricing correctly.
+that price and attached to the span; otherwise no `llm.cost.*` attributes
+are sent for that call. So filling in a price only ever adds cost data
+where there was none — it never fabricates a number for a model you
+haven't priced.
 
 `GET /v1/models` also exposes each model's `input_price_per_1m` /
 `output_price_per_1m`, so a client (or a cost-estimating tool) can look up
@@ -314,18 +339,22 @@ Docker host but not in this compose file, use the host's LAN IP or a shared
 Docker network, not `localhost` (that resolves inside the proxy's own
 container).
 
-**Traces aren't showing up in Langfuse** — confirm that team's three
-Langfuse fields are all filled in (`/admin` → Teams → edit) and that the
-proxy container can reach that Langfuse host. A failed export logs
-`Langfuse error: ...` to stdout without failing the actual request.
+**Traces aren't showing up in Phoenix** — check, in order: (1) `/admin` →
+Settings has a real endpoint and API key saved; (2) that team's card has
+**Tracing enabled** checked; (3) the proxy container can actually reach the
+Phoenix endpoint (`docker exec <container> python3 -c "import socket;
+socket.create_connection(('<host>', <port>), timeout=5)"`); (4) the API key
+is a Phoenix **System** key, not a personal User key — Phoenix rejects a
+User key used this way. A failed export logs `Phoenix error: ...` (or the
+underlying OTLP exporter's own `Transient error ... Connection refused`,
+etc.) to stdout without failing the actual request.
 
 **Curl examples show the wrong host** — set `PUBLIC_BASE_URL` in `.env` (see
 [Configuration reference](#configuration-reference)).
 
-**A model shows $0 cost in Langfuse even though tokens were used** —
-Langfuse doesn't recognize that model name and has no built-in price for it
-(common for self-hosted, custom, or newly-released models). Set its price
-on that backend's card in `/admin` — see [Cost tracking](#cost-tracking).
+**A model shows real token counts in Phoenix but no cost** — nothing in the
+pipeline has a price for that model. Set one on that backend's card in
+`/admin` — see [Cost tracking](#cost-tracking).
 
 ## Development
 

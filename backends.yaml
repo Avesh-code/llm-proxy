@@ -47,9 +47,10 @@ backends:
   #     - meta-llama/Llama-3.1-70B-Instruct
 
   # Example Ollama backend — uncomment and point at your server.
-  # Ollama's OpenAI-compatible routes live under /v1/... same as above;
-  # its native routes (/api/chat, /api/tags, ...) are proxied too, just
-  # without Langfuse tracing (see LLM_ENDPOINTS in proxy.py).
+  # Ollama's OpenAI-compatible routes live under /v1/... same as above; those
+  # are the only ones this proxy currently recognizes and traces (see
+  # LLM_ENDPOINTS in proxy.py) — its native routes (/api/chat, /api/tags,
+  # ...) aren't supported yet and get a 400.
   # ollama-local:
   #   base_url: http://ollama.internal:11434
   #   models:

@@ -331,6 +331,10 @@
         <svg class="icon" viewBox="0 0 24 24"><path d="M16 19v-1.5a3.5 3.5 0 0 0-3.5-3.5h-5A3.5 3.5 0 0 0 4 17.5V19"/><circle cx="9" cy="8" r="3.2"/><path d="M18.5 19v-1.5a3.3 3.3 0 0 0-2.2-3.1"/><path d="M14.8 4.9a3.2 3.2 0 0 1 0 6.1"/></svg>
         Teams <span class="count" id="tab-teams-count"></span>
       </div>
+      <div class="tab" data-tab="settings" onclick="showTab('settings')">
+        <svg class="icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1.04 1.56V21a2 2 0 0 1-4 0v-.09A1.7 1.7 0 0 0 9 19.4a1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.56-1.04H3a2 2 0 0 1 0-4h.09A1.7 1.7 0 0 0 4.6 9a1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34H9a1.7 1.7 0 0 0 1.04-1.56V3a2 2 0 0 1 4 0v.09a1.7 1.7 0 0 0 1.04 1.56 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87V9a1.7 1.7 0 0 0 1.56 1.04H21a2 2 0 0 1 0 4h-.09a1.7 1.7 0 0 0-1.56 1.04Z"/></svg>
+        Settings
+      </div>
     </div>
 
     <!-- ── Backends ─────────────────────────────────────────────────── -->
@@ -383,9 +387,9 @@
           <label>Models <span class="field-hint">one per line: <code>model-id, input $/1M tokens, output $/1M tokens</code> — prices optional, omit for a free/self-hosted model</span></label>
           <textarea id="bf-models" placeholder="gpt-4o, 2.50, 10.00&#10;llama3"></textarea>
           <p class="field-hint" style="margin:4px 0 0">
-            Langfuse only auto-prices models it recognizes by name — anything self-hosted, custom,
-            or fine-tuned shows $0 unless you set a price here, which the proxy then forwards as the
-            actual cost instead of relying on Langfuse's own lookup.
+            A self-hosted, custom, or fine-tuned model has no price anywhere by default — set one here
+            and the proxy computes real cost from token usage and sends it as an explicit llm.cost.*
+            attribute on the trace. Leave it blank for a genuinely free/self-hosted model.
           </p>
           <div style="display:flex; align-items:center; gap:10px; margin-top:10px">
             <button type="button" id="bf-test-btn" onclick="testBackend()">
@@ -411,7 +415,7 @@
         <div class="toolbar">
           <div class="toolbar-title">
             <h2><svg class="icon" viewBox="0 0 24 24"><path d="M16 19v-1.5a3.5 3.5 0 0 0-3.5-3.5h-5A3.5 3.5 0 0 0 4 17.5V19"/><circle cx="9" cy="8" r="3.2"/></svg>Teams</h2>
-            <span class="sub">One token &amp; one Langfuse project per team</span>
+            <span class="sub">One token &amp; one Phoenix project per team</span>
           </div>
           <button class="primary" onclick="openTeamForm()">
             <svg class="icon" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
@@ -449,26 +453,46 @@
           <div class="divider"></div>
           <div class="form-section-title">
             <svg class="icon" viewBox="0 0 24 24"><path d="M3 3v18h18"/><path d="M7 15l4-6 3 3 5-8"/></svg>
-            Tracing — this team's Langfuse project
+            Tracing — this team's Phoenix project
           </div>
-          <p class="card-desc" style="margin-top:2px">Every chat/completions call from this team traces into its own project — model, input/output, token usage, latency. Leave blank to run this team with no tracing.</p>
-          <label>Langfuse host</label>
-          <input type="url" id="tf-lf-host" placeholder="http://langfuse.internal:3001">
-          <div class="row">
-            <div>
-              <label>Public key</label>
-              <input type="text" id="tf-lf-public-key" placeholder="pk-lf-...">
-            </div>
-            <div>
-              <label>Secret key <span class="field-hint" id="tf-lf-key-hint"></span></label>
-              <input type="password" id="tf-lf-secret-key" placeholder="leave blank to keep current">
-            </div>
-          </div>
+          <p class="card-desc" style="margin-top:2px">Every chat/completions call from this team traces into its own Arize Phoenix project — model, input/output, token usage, latency, cost. Uses the one Phoenix connection configured under <b>Settings</b>; nothing to enter here per team except the project name.</p>
+          <label style="display:flex; align-items:center; gap:8px; flex-direction:row">
+            <input type="checkbox" id="tf-tracing-enabled" style="width:auto" checked>
+            <span style="color:var(--text)">Tracing enabled</span>
+          </label>
+          <label>Project name <span class="field-hint">leave blank to use the team name itself</span></label>
+          <input type="text" id="tf-project-name" placeholder="defaults to this team's name">
 
           <div class="divider"></div>
           <div style="display:flex; justify-content:flex-end; gap:8px">
             <button type="button" onclick="closeTeamForm()">Cancel</button>
             <button type="submit" class="primary">Save team</button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <!-- ── Settings ─────────────────────────────────────────────────── -->
+    <div class="panel" id="panel-settings">
+      <div class="card">
+        <h2>
+          <svg class="icon" viewBox="0 0 24 24"><path d="M3 3v18h18"/><path d="M7 15l4-6 3 3 5-8"/></svg>
+          Arize Phoenix connection
+        </h2>
+        <p class="card-desc">
+          One Phoenix instance and one System API Key serve every team — each team's traces land in
+          their own project on it, named after the team by default. Generate a System API Key in
+          Phoenix under Settings → API Keys (it must be a <b>System</b> key, not a personal User key,
+          since it isn't tied to one admin's account).
+        </p>
+        <form id="settings-form" onsubmit="saveSettings(event)">
+          <label>Phoenix endpoint <span class="field-hint">e.g. https://phoenix.company.com — no trailing slash</span></label>
+          <input type="url" id="set-endpoint" placeholder="https://phoenix.company.com">
+          <label>System API key <span class="field-hint" id="set-key-hint"></span></label>
+          <input type="password" id="set-api-key" placeholder="leave blank to keep current">
+          <div class="divider"></div>
+          <div style="display:flex; justify-content:flex-end">
+            <button type="submit" class="primary">Save settings</button>
           </div>
         </form>
       </div>
@@ -616,8 +640,8 @@ function openBackendForm(name) {
 function closeBackendForm() { document.getElementById('backend-form-card').hidden = true; }
 
 // Models textarea format: one per line, "model-id" or "model-id, input$/1M, output$/1M".
-// Omitting prices (or leaving them 0) means "let Langfuse price this itself" for a
-// recognized model, or "genuinely free" for a self-hosted one — see _compute_cost in proxy.py.
+// Omitting prices (or leaving them 0) just means "no cost attribute sent for this
+// model" — see _compute_cost in proxy.py.
 function parseModelsText(text) {
   return text.split('\n').map(s => s.trim()).filter(Boolean).map(line => {
     const parts = line.split(',').map(p => p.trim());
@@ -709,7 +733,7 @@ function renderTeams() {
   document.getElementById('tab-teams-count').textContent = names.length || '';
   for (const name of names) {
     const t = teamsCache[name];
-    const lf = t.langfuse || {};
+    const phx = t.phoenix || {};
     const tr = document.createElement('tr');
     tr.innerHTML = `
       <td class="name-cell">${esc(name)}</td>
@@ -718,7 +742,7 @@ function renderTeams() {
           <svg class="icon" viewBox="0 0 24 24"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
         </button></td>
       <td>${(t.backends || []).map(b => `<span class="chip">${esc(b)}</span>`).join('') || '<span style="color:var(--muted-2)">none</span>'}</td>
-      <td>${lf.enabled ? `<span class="chip tracing-on">● ${esc(lf.host || '')}</span>` : '<span class="chip tracing-off">off</span>'}</td>
+      <td>${phx.tracing_active ? `<span class="chip tracing-on">● ${esc(phx.effective_project_name || name)}</span>` : '<span class="chip tracing-off">off</span>'}</td>
       <td class="actions">
         <button class="small" onclick="showCurl('${escAttr(name)}')">
           <svg class="icon" viewBox="0 0 24 24"><path d="m8 9-3 3 3 3M16 9l3 3-3 3M13 5l-2 14"/></svg>
@@ -777,23 +801,24 @@ function openTeamForm(name) {
   document.getElementById('team-form').reset();
   if (name) {
     const t = teamsCache[name];
-    const lf = t.langfuse || {};
+    const phx = t.phoenix || {};
     document.getElementById('team-form-title').textContent = 'Edit team: ' + name;
     document.getElementById('tf-original-name').value = name;
     document.getElementById('tf-name').value = name;
     document.getElementById('tf-name').disabled = true;
     document.getElementById('tf-token').value = t.token;
     document.getElementById('tf-token').placeholder = '';
-    document.getElementById('tf-lf-host').value = lf.host || '';
-    document.getElementById('tf-lf-public-key').value = lf.public_key || '';
-    document.getElementById('tf-lf-key-hint').textContent = lf.secret_key ? `(currently set: ${lf.secret_key})` : '(none set)';
+    document.getElementById('tf-tracing-enabled').checked = phx.enabled !== false;
+    document.getElementById('tf-project-name').value = phx.project_name || '';
+    document.getElementById('tf-project-name').placeholder = `defaults to "${name}"`;
     renderTeamBackendCheckboxes(t.backends || []);
   } else {
     document.getElementById('team-form-title').textContent = 'Add team';
     document.getElementById('tf-original-name').value = '';
     document.getElementById('tf-name').disabled = false;
     document.getElementById('tf-token').placeholder = 'auto-generated on save';
-    document.getElementById('tf-lf-key-hint').textContent = '';
+    document.getElementById('tf-tracing-enabled').checked = true;
+    document.getElementById('tf-project-name').placeholder = 'defaults to this team\'s name';
     renderTeamBackendCheckboxes([]);
   }
   document.getElementById('team-form-card').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
@@ -818,9 +843,8 @@ async function saveTeam(ev) {
       body: JSON.stringify({
         token: document.getElementById('tf-token').value.trim(),
         backends,
-        langfuse_host: document.getElementById('tf-lf-host').value.trim(),
-        langfuse_public_key: document.getElementById('tf-lf-public-key').value.trim(),
-        langfuse_secret_key: document.getElementById('tf-lf-secret-key').value,
+        tracing_enabled: document.getElementById('tf-tracing-enabled').checked,
+        project_name: document.getElementById('tf-project-name').value.trim(),
       }),
     });
     closeTeamForm();
@@ -847,6 +871,30 @@ function copyText(text, btn) {
   }).catch(() => {});
 }
 
+// ── Settings (global Phoenix connection) ────────────────────────────────────
+async function loadSettings() {
+  const s = await api('/admin/api/settings/phoenix');
+  document.getElementById('set-endpoint').value = s.endpoint || '';
+  document.getElementById('set-key-hint').textContent = s.api_key ? `(currently set: ${s.api_key})` : '(none set)';
+}
+
+async function saveSettings(ev) {
+  ev.preventDefault();
+  try {
+    const res = await api('/admin/api/settings/phoenix', {
+      method: 'PUT',
+      body: JSON.stringify({
+        endpoint: document.getElementById('set-endpoint').value.trim(),
+        api_key: document.getElementById('set-api-key').value,
+      }),
+    });
+    toast(res.teams_now_tracing.length
+      ? `Saved — now tracing: ${res.teams_now_tracing.join(', ')}`
+      : 'Saved — no team is tracing yet (check each team has tracing enabled).');
+    await Promise.all([loadSettings(), loadTeams()]);
+  } catch (e) { toast(e.message, false); }
+}
+
 // ── Misc ──────────────────────────────────────────────────────────────────
 function esc(s) { return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function escAttr(s) { return esc(s).replace(/"/g, '&quot;'); }
@@ -855,6 +903,7 @@ async function loadAll() {
   await Promise.all([
     loadBackends(),
     loadTeams(),
+    loadSettings(),
     fetch('/health').then(r => r.json()).then(h => { publicBaseUrl = h.public_base_url || null; }).catch(() => {}),
   ]);
 }

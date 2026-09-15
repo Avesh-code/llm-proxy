@@ -12,7 +12,9 @@ import yaml
 from fastapi import FastAPI, Request, Response, BackgroundTasks, Depends, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
 from pydantic import BaseModel
-from langfuse import Langfuse, propagate_attributes
+from phoenix.otel import register
+from opentelemetry.trace import Status, StatusCode, NoOpTracerProvider
+from openinference.semconv.trace import SpanAttributes, OpenInferenceSpanKindValues, OpenInferenceMimeTypeValues
 from contextlib import asynccontextmanager
 import uvicorn
 
@@ -35,11 +37,13 @@ PUBLIC_BASE_URL  = os.getenv("PUBLIC_BASE_URL",       "").rstrip("/")
 DEFAULT_BACKEND_CONCURRENCY = 20
 
 # Legacy env vars — read once, only to seed data/config.json on first boot.
-# After that file exists, these are ignored; edit backends/teams/tracing via
-# the admin UI (or the JSON file) instead.
-_LEGACY_LANGFUSE_HOST       = os.getenv("LANGFUSE_HOST",       "")
-_LEGACY_LANGFUSE_PUBLIC_KEY = os.getenv("LANGFUSE_PUBLIC_KEY", "")
-_LEGACY_LANGFUSE_SECRET_KEY = os.getenv("LANGFUSE_SECRET_KEY", "")
+# After that file exists, these are ignored; edit the Phoenix endpoint/key at
+# /admin instead. Unlike Langfuse's per-project key pairs, Arize Phoenix
+# authenticates with one instance-wide System API Key — every team's traces
+# go to the same Phoenix instance, split into per-team projects by name, so
+# there's exactly one endpoint/key for the whole proxy, not one per team.
+_LEGACY_PHOENIX_ENDPOINT = os.getenv("PHOENIX_COLLECTOR_ENDPOINT", "")
+_LEGACY_PHOENIX_API_KEY  = os.getenv("PHOENIX_API_KEY",            "")
 
 if not ADMIN_TOKEN:
     print("Missing required env var: ADMIN_TOKEN (generate one: openssl rand -hex 24)", flush=True)
@@ -67,8 +71,20 @@ class ConfigStore:
             self._write(data)
         data.setdefault("backends", {})
         data.setdefault("teams", {})
-        for cfg in data["teams"].values():
-            cfg.setdefault("langfuse", {"enabled": False, "host": "", "public_key": "", "secret_key": ""})
+        # Phoenix's endpoint/key are instance-wide, not per-team (one System
+        # API Key authenticates writes to every project on that instance) —
+        # this is the one genuinely global setting in the whole config.
+        data.setdefault("settings", {})
+        data["settings"].setdefault("phoenix", {
+            "endpoint": _LEGACY_PHOENIX_ENDPOINT,
+            "api_key":  _LEGACY_PHOENIX_API_KEY,
+        })
+        for name, cfg in data["teams"].items():
+            # A blank project_name means "use the team's own name" — the
+            # point of one shared admin key is that a team shows up in its
+            # own Phoenix project with zero per-team setup.
+            cfg.setdefault("phoenix", {"enabled": True, "project_name": ""})
+            cfg.pop("langfuse", None)  # dead key from the pre-Phoenix schema
         # Upgrade a config.json written before per-model pricing existed,
         # where "models" was just a list of id strings.
         for cfg in data["backends"].values():
@@ -80,17 +96,10 @@ class ConfigStore:
         return data
 
     def _migrate_from_yaml(self, legacy_yaml_path: str) -> dict:
-        data = {"backends": {}, "teams": {}}
-        # Every team gets its own Langfuse project (host/public/secret key),
-        # entered on that team's admin form. The legacy LANGFUSE_* env vars
-        # are only used here, once, as the starting value for teams imported
-        # from backends.yaml — new teams get their keys typed in at /admin.
-        seed_langfuse = {
-            "enabled":    bool(_LEGACY_LANGFUSE_HOST and _LEGACY_LANGFUSE_PUBLIC_KEY
-                                and _LEGACY_LANGFUSE_SECRET_KEY),
-            "host":       _LEGACY_LANGFUSE_HOST,
-            "public_key": _LEGACY_LANGFUSE_PUBLIC_KEY,
-            "secret_key": _LEGACY_LANGFUSE_SECRET_KEY,
+        data = {
+            "backends": {},
+            "teams": {},
+            "settings": {"phoenix": {"endpoint": _LEGACY_PHOENIX_ENDPOINT, "api_key": _LEGACY_PHOENIX_API_KEY}},
         }
         yp = Path(legacy_yaml_path)
         if not yp.exists():
@@ -111,7 +120,9 @@ class ConfigStore:
             data["teams"][name] = {
                 "token":    os.getenv(token_env, "") if token_env else "",
                 "backends": cfg.get("backends") or [],
-                "langfuse": dict(seed_langfuse),
+                # Every team traces automatically, into a project named
+                # after itself, the moment settings.phoenix has real values.
+                "phoenix":  {"enabled": True, "project_name": ""},
             }
         print(f"One-time migration: imported {legacy_yaml_path} -> {self.path}", flush=True)
         return data
@@ -204,41 +215,73 @@ def require_admin(request: Request):
         raise HTTPException(status_code=401, detail="unauthorized")
 
 
-# ── Tracing (Langfuse) ────────────────────────────────────────────────────────
-# One Langfuse client per team — each team traces into its own project. Built
-# directly (not get_client()) so a team's client can be swapped out the
-# moment an admin edits its keys, with no restart. A team with no (or
-# incomplete) Langfuse keys gets tracing_enabled=False, which makes every
-# start_as_current_observation() call a real no-op instead of needing a
-# separate code path in the proxy handler below.
-_LANGFUSE_CLIENTS: dict = {}
+# ── Tracing (Arize Phoenix) ───────────────────────────────────────────────────
+# One OTLP TracerProvider per team, each pointed at the same Phoenix instance
+# (one instance-wide System API Key, set once in settings.phoenix) but tagged
+# with its own project name — so every team gets its own project for free,
+# named after the team itself unless overridden, with zero per-team key
+# management. A team with tracing off, or missing global endpoint/key, gets a
+# real OTEL NoOpTracerProvider: every span call on it is a harmless no-op, so
+# nothing in the request-handling code below needs to branch on it.
+_PHOENIX_TRACERS: dict = {}
 
 
-def _build_langfuse(cfg: dict) -> Langfuse:
-    cfg = cfg or {}
-    enabled = bool(cfg.get("enabled") and cfg.get("host") and cfg.get("public_key") and cfg.get("secret_key"))
-    return Langfuse(
-        public_key=cfg.get("public_key") or "disabled",
-        secret_key=cfg.get("secret_key") or "disabled",
-        host=cfg.get("host") or "http://localhost",
-        tracing_enabled=enabled,
-    )
+def _build_phoenix_tracer(team_name: str) -> dict:
+    team_cfg = store.data["teams"].get(team_name, {}).get("phoenix", {})
+    settings = store.data.get("settings", {}).get("phoenix", {})
+    endpoint = (settings.get("endpoint") or "").rstrip("/")
+    api_key  = settings.get("api_key") or ""
+    enabled  = bool(team_cfg.get("enabled", True) and endpoint and api_key)
+    if enabled:
+        provider = register(
+            endpoint=f"{endpoint}/v1/traces",
+            api_key=api_key,
+            project_name=team_cfg.get("project_name") or team_name,
+            protocol="http/protobuf",
+            batch=True,
+            set_global_tracer_provider=False,
+            verbose=False,
+        )
+    else:
+        provider = NoOpTracerProvider()
+    return {"provider": provider, "tracer": provider.get_tracer(team_name)}
 
 
-def _reinit_team_langfuse(team: str):
-    _LANGFUSE_CLIENTS[team] = _build_langfuse(store.data["teams"].get(team, {}).get("langfuse"))
+def _reinit_team_tracer(team: str):
+    _PHOENIX_TRACERS[team] = _build_phoenix_tracer(team)
 
 
-def _get_langfuse(team: str) -> Langfuse:
-    client = _LANGFUSE_CLIENTS.get(team)
-    if client is None:
-        client = _build_langfuse(store.data["teams"].get(team, {}).get("langfuse"))
-        _LANGFUSE_CLIENTS[team] = client
-    return client
+def _reinit_all_tracers():
+    # The Phoenix endpoint/key are global — changing them invalidates every
+    # team's cached tracer, not just one.
+    for _name in store.data["teams"]:
+        _reinit_team_tracer(_name)
 
 
-for _team_name in store.data["teams"]:
-    _reinit_team_langfuse(_team_name)
+def _get_phoenix(team: str) -> dict:
+    entry = _PHOENIX_TRACERS.get(team)
+    if entry is None:
+        entry = _build_phoenix_tracer(team)
+        _PHOENIX_TRACERS[team] = entry
+    return entry
+
+
+def _flush_phoenix(provider):
+    try:
+        flush = getattr(provider, "force_flush", None)
+        if flush:
+            flush(timeout_millis=5000)
+    except Exception as e:
+        print(f"Phoenix export error: {e}", flush=True)
+
+
+def _team_tracing_enabled(name: str) -> bool:
+    team_cfg = store.data["teams"].get(name, {}).get("phoenix", {})
+    settings = store.data.get("settings", {}).get("phoenix", {})
+    return bool(team_cfg.get("enabled", True) and settings.get("endpoint") and settings.get("api_key"))
+
+
+_reinit_all_tracers()
 
 # ── httpx ─────────────────────────────────────────────────────────────────────
 HTTPX_TIMEOUT = httpx.Timeout(connect=30.0, read=float(PROXY_TIMEOUT), write=60.0, pool=10.0)
@@ -252,14 +295,16 @@ async def lifespan(app: FastAPI):
         timeout=HTTPX_TIMEOUT,
         limits=httpx.Limits(max_connections=100, max_keepalive_connections=20, keepalive_expiry=30),
     )
-    traced = [n for n, c in store.data["teams"].items() if c.get("langfuse", {}).get("enabled")]
+    traced = [n for n in store.data["teams"] if _team_tracing_enabled(n)]
+    phx = store.data.get("settings", {}).get("phoenix", {})
     print(f"""
 ╔══════════════════════════════════════════════════╗
 ║        LLM Proxy  — port {PROXY_PORT}                       ║
 ╠══════════════════════════════════════════════════╣
 ║  Backends  : {", ".join(sorted(BACKENDS)) or "(none yet — add via /admin)":<36}║
 ║  Teams     : {", ".join(sorted(TEAMS)) or "(none yet — add via /admin)":<36}║
-║  Tracing   : {(", ".join(sorted(traced)) + " (per-team Langfuse project)") if traced else "no team has tracing configured yet":<36}║
+║  Phoenix   : {(phx.get("endpoint") or "not configured — set it at /admin"):<36}║
+║  Tracing   : {(", ".join(sorted(traced)) + " (one Phoenix project per team)") if traced else "no team has tracing configured yet":<36}║
 ╚══════════════════════════════════════════════════╝
 Admin UI:                http://<this-host>:{PROXY_PORT}/admin
 Point developers at:     http://<this-host>:{PROXY_PORT}/<backend>/...
@@ -268,8 +313,8 @@ Health check:            http://<this-host>:{PROXY_PORT}/health
 """, flush=True)
     yield
     await http_client.aclose()
-    for _client in _LANGFUSE_CLIENTS.values():
-        _client.flush()
+    for _entry in _PHOENIX_TRACERS.values():
+        _flush_phoenix(_entry["provider"])
 
 
 app = FastAPI(lifespan=lifespan)
@@ -291,8 +336,7 @@ async def health():
         "public_base_url": PUBLIC_BASE_URL or None,
         "backends": {name: {"type": b.get("type", "openai"), "base_url": b["base_url"], "models": b["models"]}
                      for name, b in BACKENDS.items()},
-        "teams":    {name: {"backends": cfg["backends"],
-                             "tracing": store.data["teams"].get(name, {}).get("langfuse", {}).get("enabled", False)}
+        "teams":    {name: {"backends": cfg["backends"], "tracing": _team_tracing_enabled(name)}
                      for name, cfg in TEAMS.items()},
     }
 
@@ -401,9 +445,13 @@ class BackendIn(BaseModel):
 class TeamIn(BaseModel):
     token: str = ""                    # PUT with "" on an existing team keeps its current token;
     backends: list[str] = []           # on create, "" means "generate one server-side"
-    langfuse_host: str = ""            # this team's own Langfuse project — blank host/public_key
-    langfuse_public_key: str = ""      # disables tracing for the team, same as leaving the whole
-    langfuse_secret_key: str = ""      # section empty. PUT with secret_key="" keeps the current one.
+    tracing_enabled: bool = True       # off = this team's tracer is a no-op regardless of settings.phoenix
+    project_name: str = ""             # blank = use the team's own name as the Phoenix project
+
+
+class PhoenixSettingsIn(BaseModel):
+    endpoint: str = ""    # e.g. https://phoenix.company.com — no trailing slash, no /v1/traces suffix
+    api_key: str = ""     # a Phoenix System API Key. PUT with "" keeps the current one.
 
 
 @app.get("/admin/api/backends", dependencies=[Depends(require_admin)])
@@ -475,9 +523,10 @@ async def admin_test_backend(name: str, body: BackendIn):
 async def admin_list_teams():
     out = {}
     for name, cfg in store.data["teams"].items():
-        lf = dict(cfg.get("langfuse", {}))
-        lf["secret_key"] = _mask(lf.get("secret_key", ""))
-        out[name] = {**cfg, "langfuse": lf}
+        phx = dict(cfg.get("phoenix", {}))
+        phx["effective_project_name"] = phx.get("project_name") or name
+        phx["tracing_active"] = _team_tracing_enabled(name)
+        out[name] = {**cfg, "phoenix": phx}
     return out
 
 
@@ -489,30 +538,14 @@ async def admin_upsert_team(name: str, body: TeamIn):
     unknown = [b for b in body.backends if b not in store.data["backends"]]
     if unknown:
         raise HTTPException(status_code=400, detail=f"unknown backend(s): {unknown}")
-    existing    = store.data["teams"].get(name, {})
-    existing_lf = existing.get("langfuse", {})
-    token       = body.token or existing.get("token") or secrets.token_hex(24)
-    # Blank public_key/secret_key on an update means "keep the current
-    # value" (same convention as a blank token or backend api_key) — a
-    # caller updating just one field (e.g. only the host, via a direct API
-    # call rather than the admin UI, which always resends the full form)
-    # must not silently wipe the others. host has no such fallback: an
-    # explicitly blank host is the deliberate way to disable tracing
-    # without discarding the keys, so it can be turned back on later by
-    # setting the host again alone.
-    public_key  = body.langfuse_public_key or existing_lf.get("public_key", "")
-    secret_key  = body.langfuse_secret_key or existing_lf.get("secret_key", "")
-    langfuse_cfg = {
-        "enabled":    bool(body.langfuse_host and public_key and secret_key),
-        "host":       body.langfuse_host,
-        "public_key": public_key,
-        "secret_key": secret_key,
-    }
-    store.data["teams"][name] = {"token": token, "backends": body.backends, "langfuse": langfuse_cfg}
+    existing = store.data["teams"].get(name, {})
+    token    = body.token or existing.get("token") or secrets.token_hex(24)
+    phoenix_cfg = {"enabled": body.tracing_enabled, "project_name": body.project_name}
+    store.data["teams"][name] = {"token": token, "backends": body.backends, "phoenix": phoenix_cfg}
     await store.save()
     _rebuild_indexes()
-    _reinit_team_langfuse(name)
-    return {"ok": True, "name": name, "token": token, "tracing_enabled": langfuse_cfg["enabled"]}
+    _reinit_team_tracer(name)
+    return {"ok": True, "name": name, "token": token, "tracing_enabled": _team_tracing_enabled(name)}
 
 
 @app.delete("/admin/api/teams/{name}", dependencies=[Depends(require_admin)])
@@ -522,8 +555,32 @@ async def admin_delete_team(name: str):
     del store.data["teams"][name]
     await store.save()
     _rebuild_indexes()
-    _LANGFUSE_CLIENTS.pop(name, None)
+    _PHOENIX_TRACERS.pop(name, None)
     return {"ok": True}
+
+
+@app.get("/admin/api/settings/phoenix", dependencies=[Depends(require_admin)])
+async def admin_get_phoenix_settings():
+    phx = dict(store.data.get("settings", {}).get("phoenix", {}))
+    phx["api_key"] = _mask(phx.get("api_key", ""))
+    return phx
+
+
+@app.put("/admin/api/settings/phoenix", dependencies=[Depends(require_admin)])
+async def admin_set_phoenix_settings(body: PhoenixSettingsIn):
+    # This is the one genuinely global setting in the whole config — a
+    # single Phoenix instance and one System API Key serve every team's
+    # project, unlike Langfuse's old per-team key pairs. Changing it
+    # invalidates every team's cached tracer, not just one.
+    existing = store.data.get("settings", {}).get("phoenix", {})
+    store.data.setdefault("settings", {})["phoenix"] = {
+        "endpoint": body.endpoint.rstrip("/"),
+        "api_key":  body.api_key or existing.get("api_key", ""),
+    }
+    await store.save()
+    _reinit_all_tracers()
+    active = [n for n in store.data["teams"] if _team_tracing_enabled(n)]
+    return {"ok": True, "teams_now_tracing": sorted(active)}
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -570,17 +627,15 @@ def _parse_usage(usage):
 
 def _compute_cost(backend_cfg: dict, model: str, usage: dict):
     """
-    Langfuse only auto-prices models it recognizes by name — a self-hosted
-    model, a custom fine-tune, or a typo'd model id all silently show $0.
-    So pricing is looked up from what's configured on the backend itself
-    (set per-model in /admin, in USD per 1,000,000 tokens) and forwarded as
-    an explicit cost, bypassing Langfuse's own lookup entirely.
+    A self-hosted model, a custom fine-tune, or a typo'd model id has no
+    known price anywhere, so it would otherwise just show $0 despite real
+    token usage. Pricing is looked up from what's configured on the backend
+    itself (set per-model in /admin, in USD per 1,000,000 tokens) and
+    forwarded as an explicit llm.cost.* attribute on the span.
 
-    Returns None — meaning "don't override, let Langfuse do its own
-    lookup" — whenever the model isn't registered here or has no price set,
-    so a genuinely free/self-hosted model or a model Langfuse already prices
-    correctly (e.g. real gpt-4o with nothing entered) isn't clobbered with
-    an explicit $0.
+    Returns None whenever the model isn't registered here or has no price
+    set, so a genuinely free/self-hosted model isn't given a misleading
+    explicit $0 — it just reports token usage with no cost attached.
     """
     if not usage:
         return None
@@ -725,9 +780,44 @@ async def proxy(backend: str, rest: str, request: Request, background_tasks: Bac
     tags       = [t for t in [model, backend, service] if t]
     is_stream  = body_j.get("stream", False)
     start_ms   = time.time()
-    # Each team traces into its own Langfuse project; a team with no keys
-    # configured gets a no-op client, so nothing below needs to branch on it.
-    langfuse   = _get_langfuse(team)
+    # Each team traces into its own Phoenix project via that team's cached
+    # tracer; a team with tracing off (or no global endpoint/key set yet)
+    # gets a real OTEL no-op tracer, so nothing below needs to branch on it.
+    phx    = _get_phoenix(team)
+    tracer = phx["tracer"]
+
+    def _base_span_attrs():
+        attrs = {
+            SpanAttributes.OPENINFERENCE_SPAN_KIND: OpenInferenceSpanKindValues.LLM.value,
+            SpanAttributes.LLM_MODEL_NAME: model,
+            SpanAttributes.TAG_TAGS: tags,
+            "proxy.backend": backend,
+            "proxy.service": service,
+            "proxy.path": f"/{backend}/{rest}",
+        }
+        if user_id:
+            attrs[SpanAttributes.USER_ID] = user_id
+        if messages is not None:
+            attrs[SpanAttributes.INPUT_VALUE] = json.dumps(messages, default=str)
+            attrs[SpanAttributes.INPUT_MIME_TYPE] = OpenInferenceMimeTypeValues.JSON.value
+        return attrs
+
+    def _result_span_attrs(ms, output=None, usage=None, cost=None, status_code=None):
+        attrs = {"proxy.latency_ms": ms}
+        if status_code is not None:
+            attrs["proxy.status_code"] = status_code
+        if output is not None:
+            attrs[SpanAttributes.OUTPUT_VALUE] = json.dumps(output, default=str)
+            attrs[SpanAttributes.OUTPUT_MIME_TYPE] = OpenInferenceMimeTypeValues.JSON.value
+        if usage:
+            attrs[SpanAttributes.LLM_TOKEN_COUNT_PROMPT]     = usage["input"]
+            attrs[SpanAttributes.LLM_TOKEN_COUNT_COMPLETION] = usage["output"]
+            attrs[SpanAttributes.LLM_TOKEN_COUNT_TOTAL]      = usage["total"]
+        if cost:
+            attrs[SpanAttributes.LLM_COST_PROMPT]     = cost["input"]
+            attrs[SpanAttributes.LLM_COST_COMPLETION] = cost["output"]
+            attrs[SpanAttributes.LLM_COST_TOTAL]      = cost["total"]
+        return attrs
 
     # ── Streaming ─────────────────────────────────────────────────────────────
     if is_stream:
@@ -741,33 +831,14 @@ async def proxy(backend: str, rest: str, request: Request, background_tasks: Bac
         collected = []
         err_box   = [None]
 
-        # Deliberately NOT a `with` block. `stream_gen` below is an async
-        # generator — its body doesn't run until Starlette iterates it while
-        # writing the response, which happens after this function returns.
-        # A `with langfuse.start_as_current_observation(...):` wrapped around
-        # that `return` would exit (ending the span, locking in ~0 latency)
-        # immediately on return, before any real streaming — or its eventual
-        # .update() — ever happened. Managing the spans manually and ending
-        # them from inside stream_gen()'s `finally` keeps them open for the
-        # actual duration of the stream instead.
-        with propagate_attributes(user_id=user_id, tags=tags):
-            root_span = langfuse.start_observation(
-                as_type  = "span",
-                name     = trace_name,
-                input    = messages,
-                metadata = {"path": f"/{backend}/{rest}", "model": model, "backend": backend, "service": service},
-            )
-            gen_span = root_span.start_observation(
-                as_type          = "generation",
-                name             = "chat-completion",
-                model            = model,
-                input            = messages,
-                model_parameters = {
-                    "temperature": body_j.get("temperature"),
-                    "max_tokens":  body_j.get("max_tokens"),
-                    "top_p":       body_j.get("top_p"),
-                },
-            )
+        # tracer.start_span (not `with tracer.start_as_current_span(...)`)
+        # deliberately. stream_gen below is an async generator — its body,
+        # and the span.end() inside its `finally`, don't run until Starlette
+        # iterates it after this function returns. A `with` block wrapped
+        # around that `return` would exit — ending the span, locking in ~0
+        # latency and no output — immediately on return, before any of the
+        # real streaming (or this span's eventual attributes) ever happened.
+        span = tracer.start_span(trace_name, attributes=_base_span_attrs())
 
         async def stream_gen():
             try:
@@ -791,88 +862,59 @@ async def proxy(backend: str, rest: str, request: Request, background_tasks: Bac
                 usage = _parse_usage(usage_data)
                 cost  = _compute_cost(backend_cfg, model, usage)
                 try:
-                    output = _extract_output(parsed)
                     if err_box[0]:
-                        gen_span.update(level="ERROR", status_message=err_box[0],
-                                        metadata={"latency_ms": ms})
-                        root_span.update(level="ERROR", metadata={"latency_ms": ms})
+                        span.set_attributes(_result_span_attrs(ms))
+                        span.set_status(Status(StatusCode.ERROR, description=err_box[0][:500]))
                     else:
-                        gen_span.update(output=output, usage_details=usage, cost_details=cost,
-                                        metadata={"latency_ms": ms})
-                        root_span.update(output=output, metadata={"latency_ms": ms})
-                    gen_span.end()
-                    root_span.end()
-                    langfuse.flush()
+                        output = _extract_output(parsed)
+                        span.set_attributes(_result_span_attrs(ms, output=output, usage=usage, cost=cost))
+                        span.set_status(Status(StatusCode.OK))
+                    span.end()
+                    _flush_phoenix(phx["provider"])
                 except Exception as e:
-                    print(f"Langfuse error: {e}", flush=True)
+                    print(f"Phoenix error: {e}", flush=True)
                 _log(request.method, f"{backend}/{rest}", "stream", ms, model, service)
 
         return StreamingResponse(stream_gen(), media_type="text/event-stream")
 
     # ── Non-streaming ──────────────────────────────────────────────────────────
-    with propagate_attributes(user_id=user_id, tags=tags):
-        with langfuse.start_as_current_observation(
-            as_type  = "span",
-            name     = trace_name,
-            input    = messages,
-            metadata = {"path": f"/{backend}/{rest}", "model": model, "backend": backend, "service": service},
-        ) as root_span:
-            with langfuse.start_as_current_observation(
-                as_type          = "generation",
-                name             = "chat-completion",
-                model            = model,
-                input            = messages,
-                model_parameters = {
-                    "temperature": body_j.get("temperature"),
-                    "max_tokens":  body_j.get("max_tokens"),
-                    "top_p":       body_j.get("top_p"),
-                },
-            ) as gen_span:
-                try:
-                    async with _backend_semaphore(backend):
-                        r = await http_client.request(
-                            method=request.method, url=url, headers=headers, content=body_b
-                        )
-                    ms     = int((time.time() - start_ms) * 1000)
-                    parsed = None
-                    try:
-                        parsed = r.json()
-                    except Exception:
-                        pass
+    span = tracer.start_span(trace_name, attributes=_base_span_attrs())
+    try:
+        async with _backend_semaphore(backend):
+            r = await http_client.request(
+                method=request.method, url=url, headers=headers, content=body_b
+            )
+        ms     = int((time.time() - start_ms) * 1000)
+        parsed = None
+        try:
+            parsed = r.json()
+        except Exception:
+            pass
 
-                    level  = "ERROR" if r.status_code >= 400 else "DEFAULT"
-                    output = _extract_output(parsed)
-                    usage  = _parse_usage(parsed.get("usage") if parsed else None)
-                    cost   = _compute_cost(backend_cfg, model, usage)
+        output = _extract_output(parsed)
+        usage  = _parse_usage(parsed.get("usage") if parsed else None)
+        cost   = _compute_cost(backend_cfg, model, usage)
 
-                    gen_span.update(
-                        output         = output,
-                        level          = level,
-                        status_message = r.text if r.status_code >= 400 else None,
-                        usage_details  = usage,
-                        cost_details   = cost,
-                        metadata       = {"latency_ms": ms, "status_code": r.status_code},
-                    )
-                    root_span.update(output=output, level=level, metadata={"latency_ms": ms})
-                    try:
-                        langfuse.flush()
-                    except Exception as e:
-                        print(f"Langfuse error: {e}", flush=True)
+        span.set_attributes(_result_span_attrs(ms, output=output, usage=usage, cost=cost, status_code=r.status_code))
+        if r.status_code >= 400:
+            span.set_status(Status(StatusCode.ERROR, description=r.text[:500]))
+        else:
+            span.set_status(Status(StatusCode.OK))
+        span.end()
+        _flush_phoenix(phx["provider"])
 
-                    _log(request.method, f"{backend}/{rest}", r.status_code, ms, model, service)
-                    return Response(content=r.content, status_code=r.status_code,
-                                    headers=_resp_headers(r.headers))
+        _log(request.method, f"{backend}/{rest}", r.status_code, ms, model, service)
+        return Response(content=r.content, status_code=r.status_code,
+                        headers=_resp_headers(r.headers))
 
-                except Exception as e:
-                    ms = int((time.time() - start_ms) * 1000)
-                    gen_span.update(level="ERROR", status_message=str(e), metadata={"latency_ms": ms})
-                    root_span.update(level="ERROR", metadata={"latency_ms": ms})
-                    try:
-                        langfuse.flush()
-                    except Exception:
-                        pass
-                    print(f"Proxy error: {e}", flush=True)
-                    return JSONResponse(status_code=502, content={"error": "proxy_error", "message": str(e)})
+    except Exception as e:
+        ms = int((time.time() - start_ms) * 1000)
+        span.set_attributes(_result_span_attrs(ms))
+        span.set_status(Status(StatusCode.ERROR, description=str(e)[:500]))
+        span.end()
+        _flush_phoenix(phx["provider"])
+        print(f"Proxy error: {e}", flush=True)
+        return JSONResponse(status_code=502, content={"error": "proxy_error", "message": str(e)})
 
 
 if __name__ == "__main__":
