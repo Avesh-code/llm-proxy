@@ -785,17 +785,24 @@ async def proxy(backend: str, rest: str, request: Request, background_tasks: Bac
                 err_box[0] = str(e)
                 raise
             finally:
-                ms   = int((time.time() - start_ms) * 1000)
-                full = b"".join(collected)
+                ms     = int((time.time() - start_ms) * 1000)
+                full   = b"".join(collected)
                 parsed, usage_data = _parse_stream_buffer(full)
-                usage = _parse_usage(usage_data)
-                cost  = _compute_cost(backend_cfg, model, usage)
+                usage  = _parse_usage(usage_data)
+                cost   = _compute_cost(backend_cfg, model, usage)
+                output = _extract_output(parsed)
                 try:
-                    output = _extract_output(parsed)
+                    # Even when the connection errors out afterward, still
+                    # attach whatever output/usage/cost was actually parsed
+                    # from the bytes received so far. The backend may have
+                    # already generated -- and been billed for -- the full
+                    # completion before the connection hiccuped on the way
+                    # out; a real cost sitting right here shouldn't be
+                    # thrown away just because of what happened after it.
                     if err_box[0]:
-                        gen_span.update(level="ERROR", status_message=err_box[0],
-                                        metadata={"latency_ms": ms})
-                        root_span.update(level="ERROR", metadata={"latency_ms": ms})
+                        gen_span.update(level="ERROR", status_message=err_box[0], output=output,
+                                        usage_details=usage, cost_details=cost, metadata={"latency_ms": ms})
+                        root_span.update(level="ERROR", output=output, metadata={"latency_ms": ms})
                     else:
                         gen_span.update(output=output, usage_details=usage, cost_details=cost,
                                         metadata={"latency_ms": ms})
