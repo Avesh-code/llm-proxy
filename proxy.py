@@ -279,6 +279,7 @@ LLM_ENDPOINTS = {
     "chat/completions",    "completions",
     "v1/responses",        "responses",
     "api/chat",            "api/generate",
+    "v1/rerank",           "rerank",
 }
 
 # Only these paths are known to accept OpenAI's Chat-Completions-style
@@ -572,7 +573,7 @@ def _find_usage_dict(parsed: dict):
     Ollama's native /api/chat and /api/generate don't nest anything — the
     counts (prompt_eval_count, eval_count) sit directly on the response body.
     """
-    if not parsed:
+    if not isinstance(parsed, dict):
         return None
     if isinstance(parsed.get("usage"), dict):
         return parsed["usage"]
@@ -626,8 +627,8 @@ def _compute_cost(backend_cfg: dict, model: str, usage: dict):
 
 
 def _extract_output(parsed):
-    if not parsed:
-        return None
+    if not isinstance(parsed, dict):
+        return parsed
     choices = parsed.get("choices")
     if choices:
         return choices[0].get("message") or choices[0].get("delta") or parsed
@@ -642,6 +643,10 @@ def _extract_output(parsed):
         return parsed["message"]
     if "response" in parsed:
         return parsed["response"]
+    # Rerank (Cohere/vLLM/TEI-object-shaped): no generated text, just
+    # ranked {index, relevance_score}/{index, score} items.
+    if "results" in parsed:
+        return parsed["results"]
     return parsed
 
 
@@ -756,8 +761,10 @@ async def proxy(backend: str, rest: str, request: Request, background_tasks: Bac
     # ── LLM path ──────────────────────────────────────────────────────────────
     model      = body_j.get("model", "unknown")
     # Chat Completions sends "messages"; the Responses API sends "input"
-    # (a string or a list of role/content items) and no "messages" at all.
-    messages   = body_j.get("messages") or body_j.get("input") or body_j.get("prompt")
+    # (a string or a list of role/content items) and no "messages" at all;
+    # rerank sends neither — just "query" (+ "documents", left out of the
+    # trace input to avoid bloating it with a full document list).
+    messages   = body_j.get("messages") or body_j.get("input") or body_j.get("prompt") or body_j.get("query")
     trace_name = request.headers.get("x-trace-name") or model or "llm-request"
     user_id    = request.headers.get("x-user-id") or None
     # Derived from the validated token, so a client cannot spoof it.
