@@ -34,6 +34,18 @@ PUBLIC_BASE_URL  = os.getenv("PUBLIC_BASE_URL",       "").rstrip("/")
 # every other backend and team of connections too.
 DEFAULT_BACKEND_CONCURRENCY = 20
 
+# Starting value for the editable "supported endpoints" list (managed live
+# at /admin, persisted to data/config.json as "llm_endpoints") — only used
+# to seed a config.json that doesn't have that key yet, e.g. on first boot
+# or when upgrading from a version of the proxy older than this setting.
+DEFAULT_LLM_ENDPOINTS = [
+    "v1/chat/completions", "v1/completions",
+    "chat/completions",    "completions",
+    "v1/responses",        "responses",
+    "api/chat",            "api/generate",
+    "v1/rerank",           "rerank",
+]
+
 # Legacy env vars — read once, only to seed data/config.json on first boot.
 # After that file exists, these are ignored; edit backends/teams/tracing via
 # the admin UI (or the JSON file) instead.
@@ -67,6 +79,7 @@ class ConfigStore:
             self._write(data)
         data.setdefault("backends", {})
         data.setdefault("teams", {})
+        data.setdefault("llm_endpoints", list(DEFAULT_LLM_ENDPOINTS))
         for cfg in data["teams"].values():
             cfg.setdefault("langfuse", {"enabled": False, "host": "", "public_key": "", "secret_key": ""})
         # Upgrade a config.json written before per-model pricing existed,
@@ -135,16 +148,18 @@ class ConfigStore:
 
 store = ConfigStore(CONFIG_DATA_PATH, LEGACY_YAML_PATH)
 
-BACKENDS: dict = {}
-TEAMS:    dict = {}
-TOKENS:   dict = {}
+BACKENDS:      dict = {}
+TEAMS:         dict = {}
+TOKENS:        dict = {}
+LLM_ENDPOINTS: set  = set()
 
 
 def _rebuild_indexes():
-    global BACKENDS, TEAMS, TOKENS
-    BACKENDS = store.data["backends"]
-    TEAMS    = {name: {"backends": cfg.get("backends", [])} for name, cfg in store.data["teams"].items()}
-    TOKENS   = {cfg["token"]: name for name, cfg in store.data["teams"].items() if cfg.get("token")}
+    global BACKENDS, TEAMS, TOKENS, LLM_ENDPOINTS
+    BACKENDS      = store.data["backends"]
+    TEAMS         = {name: {"backends": cfg.get("backends", [])} for name, cfg in store.data["teams"].items()}
+    TOKENS        = {cfg["token"]: name for name, cfg in store.data["teams"].items() if cfg.get("token")}
+    LLM_ENDPOINTS = set(store.data.get("llm_endpoints") or DEFAULT_LLM_ENDPOINTS)
 
 
 _rebuild_indexes()
@@ -273,14 +288,6 @@ Health check:            http://<this-host>:{PROXY_PORT}/health
 
 
 app = FastAPI(lifespan=lifespan)
-
-LLM_ENDPOINTS = {
-    "v1/chat/completions", "v1/completions",
-    "chat/completions",    "completions",
-    "v1/responses",        "responses",
-    "api/chat",            "api/generate",
-    "v1/rerank",           "rerank",
-}
 
 # Only these paths are known to accept OpenAI's Chat-Completions-style
 # stream_options.include_usage — used solely to decide whether it's safe to
@@ -537,6 +544,29 @@ async def admin_delete_team(name: str):
     _rebuild_indexes()
     _LANGFUSE_CLIENTS.pop(name, None)
     return {"ok": True}
+
+
+class SettingsIn(BaseModel):
+    llm_endpoints: list[str]
+
+
+@app.get("/admin/api/settings", dependencies=[Depends(require_admin)])
+async def admin_get_settings():
+    return {"llm_endpoints": sorted(store.data.get("llm_endpoints") or DEFAULT_LLM_ENDPOINTS)}
+
+
+@app.put("/admin/api/settings", dependencies=[Depends(require_admin)])
+async def admin_update_settings(body: SettingsIn):
+    # Paths are matched with a leading "/" already stripped (see rest_key in
+    # the proxy route below), so normalize here too — "/v1/rerank" and
+    # "v1/rerank" typed into the same field should both work.
+    cleaned = sorted({e.strip().lstrip("/") for e in body.llm_endpoints if e.strip()})
+    if not cleaned:
+        raise HTTPException(status_code=400, detail="at least one endpoint must remain allowed")
+    store.data["llm_endpoints"] = cleaned
+    await store.save()
+    _rebuild_indexes()
+    return {"ok": True, "llm_endpoints": cleaned}
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
