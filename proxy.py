@@ -36,6 +36,18 @@ PUBLIC_BASE_URL  = os.getenv("PUBLIC_BASE_URL",       "").rstrip("/")
 # every other backend and team of connections too.
 DEFAULT_BACKEND_CONCURRENCY = 20
 
+# Starting value for the editable "supported endpoints" list (managed live
+# at /admin, persisted to data/config.json as "llm_endpoints") — only used
+# to seed a config.json that doesn't have that key yet, e.g. on first boot
+# or when upgrading from a version of the proxy older than this setting.
+DEFAULT_LLM_ENDPOINTS = [
+    "v1/chat/completions", "v1/completions",
+    "chat/completions",    "completions",
+    "v1/responses",        "responses",
+    "api/chat",            "api/generate",
+    "v1/rerank",           "rerank",
+]
+
 # Legacy env vars — read once, only to seed data/config.json on first boot.
 # After that file exists, these are ignored; edit the Phoenix endpoint/key at
 # /admin instead. Unlike Langfuse's per-project key pairs, Arize Phoenix
@@ -71,6 +83,7 @@ class ConfigStore:
             self._write(data)
         data.setdefault("backends", {})
         data.setdefault("teams", {})
+        data.setdefault("llm_endpoints", list(DEFAULT_LLM_ENDPOINTS))
         # Phoenix's endpoint/key are instance-wide, not per-team (one System
         # API Key authenticates writes to every project on that instance) —
         # this is the one genuinely global setting in the whole config.
@@ -99,6 +112,7 @@ class ConfigStore:
         data = {
             "backends": {},
             "teams": {},
+            "llm_endpoints": list(DEFAULT_LLM_ENDPOINTS),
             "settings": {"phoenix": {"endpoint": _LEGACY_PHOENIX_ENDPOINT, "api_key": _LEGACY_PHOENIX_API_KEY}},
         }
         yp = Path(legacy_yaml_path)
@@ -146,16 +160,18 @@ class ConfigStore:
 
 store = ConfigStore(CONFIG_DATA_PATH, LEGACY_YAML_PATH)
 
-BACKENDS: dict = {}
-TEAMS:    dict = {}
-TOKENS:   dict = {}
+BACKENDS:      dict = {}
+TEAMS:         dict = {}
+TOKENS:        dict = {}
+LLM_ENDPOINTS: set  = set()
 
 
 def _rebuild_indexes():
-    global BACKENDS, TEAMS, TOKENS
-    BACKENDS = store.data["backends"]
-    TEAMS    = {name: {"backends": cfg.get("backends", [])} for name, cfg in store.data["teams"].items()}
-    TOKENS   = {cfg["token"]: name for name, cfg in store.data["teams"].items() if cfg.get("token")}
+    global BACKENDS, TEAMS, TOKENS, LLM_ENDPOINTS
+    BACKENDS      = store.data["backends"]
+    TEAMS         = {name: {"backends": cfg.get("backends", [])} for name, cfg in store.data["teams"].items()}
+    TOKENS        = {cfg["token"]: name for name, cfg in store.data["teams"].items() if cfg.get("token")}
+    LLM_ENDPOINTS = set(store.data.get("llm_endpoints") or DEFAULT_LLM_ENDPOINTS)
 
 
 _rebuild_indexes()
@@ -319,10 +335,15 @@ Health check:            http://<this-host>:{PROXY_PORT}/health
 
 app = FastAPI(lifespan=lifespan)
 
-LLM_ENDPOINTS = {
-    "v1/chat/completions", "v1/completions",
-    "chat/completions",    "completions",
-    "v1/responses",        "responses",
+# Only these paths are known to accept OpenAI's Chat-Completions-style
+# stream_options.include_usage — used solely to decide whether it's safe to
+# inject that field before streaming (see the "Streaming" section below).
+# The Responses API always includes usage with no opt-in and rejects
+# unrecognized top-level fields; Ollama's native routes don't know this
+# field either and have their own way of reporting usage in the stream.
+CHAT_COMPLETIONS_STREAM_PATHS = {
+    "v1/chat/completions", "chat/completions",
+    "v1/completions",      "completions",
 }
 
 RESERVED_BACKEND_NAMES = {"admin", "health", "whoami", "v1", "models"}
@@ -583,6 +604,29 @@ async def admin_set_phoenix_settings(body: PhoenixSettingsIn):
     return {"ok": True, "teams_now_tracing": sorted(active)}
 
 
+class EndpointSettingsIn(BaseModel):
+    llm_endpoints: list[str]
+
+
+@app.get("/admin/api/settings/endpoints", dependencies=[Depends(require_admin)])
+async def admin_get_endpoint_settings():
+    return {"llm_endpoints": sorted(store.data.get("llm_endpoints") or DEFAULT_LLM_ENDPOINTS)}
+
+
+@app.put("/admin/api/settings/endpoints", dependencies=[Depends(require_admin)])
+async def admin_update_endpoint_settings(body: EndpointSettingsIn):
+    # Paths are matched with a leading "/" already stripped (see rest_key in
+    # the proxy route below), so normalize here too — "/v1/rerank" and
+    # "v1/rerank" typed into the same field should both work.
+    cleaned = sorted({e.strip().lstrip("/") for e in body.llm_endpoints if e.strip()})
+    if not cleaned:
+        raise HTTPException(status_code=400, detail="at least one endpoint must remain allowed")
+    store.data["llm_endpoints"] = cleaned
+    await store.save()
+    _rebuild_indexes()
+    return {"ok": True, "llm_endpoints": cleaned}
+
+
 # ── Helpers ────────────────────────────────────────────────────────────────────
 def _fwd_headers(h: dict, api_key: str) -> dict:
     """
@@ -610,19 +654,36 @@ def _resp_headers(h) -> dict:
     return out
 
 
+def _find_usage_dict(parsed: dict):
+    """
+    Locates whatever holds the token counts, regardless of API shape.
+    Chat Completions and the Responses API both nest a "usage" object;
+    Ollama's native /api/chat and /api/generate don't nest anything — the
+    counts (prompt_eval_count, eval_count) sit directly on the response body.
+    """
+    if not isinstance(parsed, dict):
+        return None
+    if isinstance(parsed.get("usage"), dict):
+        return parsed["usage"]
+    if "prompt_eval_count" in parsed or "eval_count" in parsed:
+        return parsed
+    return None
+
+
 def _parse_usage(usage):
     """
-    Chat Completions names these prompt_tokens/completion_tokens; the newer
-    Responses API (POST /v1/responses) names the same two things
-    input_tokens/output_tokens. Accept either.
+    Every API names these token counts differently:
+    - Chat Completions:    prompt_tokens / completion_tokens
+    - Responses API:       input_tokens / output_tokens
+    - Ollama (native):     prompt_eval_count / eval_count
+    Accept any of them.
     """
     if not usage:
         return None
-    return {
-        "input":  usage.get("prompt_tokens",     usage.get("input_tokens",  0)),
-        "output": usage.get("completion_tokens", usage.get("output_tokens", 0)),
-        "total":  usage.get("total_tokens", 0),
-    }
+    input_tok  = usage.get("prompt_tokens", usage.get("input_tokens", usage.get("prompt_eval_count", 0)))
+    output_tok = usage.get("completion_tokens", usage.get("output_tokens", usage.get("eval_count", 0)))
+    total_tok  = usage.get("total_tokens") or (input_tok + output_tok)
+    return {"input": input_tok, "output": output_tok, "total": total_tok}
 
 
 def _compute_cost(backend_cfg: dict, model: str, usage: dict):
@@ -652,8 +713,8 @@ def _compute_cost(backend_cfg: dict, model: str, usage: dict):
 
 
 def _extract_output(parsed):
-    if not parsed:
-        return None
+    if not isinstance(parsed, dict):
+        return parsed
     choices = parsed.get("choices")
     if choices:
         return choices[0].get("message") or choices[0].get("delta") or parsed
@@ -662,6 +723,16 @@ def _extract_output(parsed):
     # convenience field some clients add, not guaranteed to be present.
     if "output" in parsed:
         return parsed.get("output_text") or parsed["output"]
+    # Ollama native: /api/chat replies with "message", /api/generate with
+    # a plain "response" string.
+    if "message" in parsed:
+        return parsed["message"]
+    if "response" in parsed:
+        return parsed["response"]
+    # Rerank (Cohere/vLLM/TEI-object-shaped): no generated text, just
+    # ranked {index, relevance_score}/{index, score} items.
+    if "results" in parsed:
+        return parsed["results"]
     return parsed
 
 
@@ -672,23 +743,29 @@ def _log(method, path, status, ms, model, service):
 
 def _parse_stream_buffer(full_bytes: bytes) -> tuple:
     """
-    Parse SSE stream buffer.
-    Returns (last_data_chunk_parsed, usage_dict_or_None).
-
-    Two shapes in play:
-    - Chat Completions: a bare {"usage": ..., "choices": [...]} chunk when
+    Parses a streamed response body regardless of which of these three
+    shapes it's actually in — the proxy doesn't know in advance which one
+    a given backend/endpoint uses:
+    - Chat Completions (SSE, "data: {...}" lines): a bare
+      {"usage": ..., "choices": [...]} chunk when
       stream_options.include_usage is set.
-    - Responses API: a sequence of typed events; the final one nests the
-      complete response (including usage) under a "response" key instead
-      of putting usage at the top level — no opt-in needed for it.
+    - Responses API (SSE, "data: {...}" lines): a sequence of typed
+      events; the final one nests the complete response — including
+      usage — under a "response" key instead of at the top level, with
+      no opt-in needed.
+    - Ollama native (NDJSON, no "data:" prefix — one raw JSON object per
+      line): the final line (done: true) carries prompt_eval_count /
+      eval_count and the assembled message directly at the top level.
+
+    Returns (last_relevant_chunk_parsed, usage_dict_or_None).
     """
     parsed     = None
     usage_data = None
     for line in full_bytes.decode(errors="ignore").splitlines():
         line = line.strip()
-        if not line.startswith("data:") or "[DONE]" in line:
+        if not line or "[DONE]" in line:
             continue
-        chunk_str = line[len("data:"):].strip()
+        chunk_str = line[len("data:"):].strip() if line.startswith("data:") else line
         try:
             chunk_json = json.loads(chunk_str)
         except Exception:
@@ -703,6 +780,10 @@ def _parse_stream_buffer(full_bytes: bytes) -> tuple:
                 usage_data = response_obj["usage"]
             if response_obj.get("output") is not None:
                 parsed = response_obj
+        if "prompt_eval_count" in chunk_json or "eval_count" in chunk_json:
+            usage_data = chunk_json
+        if "message" in chunk_json or ("response" in chunk_json and not isinstance(response_obj, dict)):
+            parsed = chunk_json
     return parsed, usage_data
 
 
@@ -741,11 +822,6 @@ async def proxy(backend: str, rest: str, request: Request, background_tasks: Bac
     body_b  = await request.body()
     rest_key = rest.lstrip("/")
     is_llm   = rest_key in LLM_ENDPOINTS
-    # The Responses API (POST /v1/responses) already includes usage on
-    # every stream's final event with no opt-in — unlike Chat Completions,
-    # it doesn't accept a "stream_options" field, so injecting one below
-    # would be rejected outright.
-    is_responses_api = rest_key in {"v1/responses", "responses"}
 
     body_j = {}
     if body_b and is_llm:
@@ -771,8 +847,10 @@ async def proxy(backend: str, rest: str, request: Request, background_tasks: Bac
     # ── LLM path ──────────────────────────────────────────────────────────────
     model      = body_j.get("model", "unknown")
     # Chat Completions sends "messages"; the Responses API sends "input"
-    # (a string or a list of role/content items) and no "messages" at all.
-    messages   = body_j.get("messages") or body_j.get("input") or body_j.get("prompt")
+    # (a string or a list of role/content items) and no "messages" at all;
+    # rerank sends neither — just "query" (+ "documents", left out of the
+    # trace input to avoid bloating it with a full document list).
+    messages   = body_j.get("messages") or body_j.get("input") or body_j.get("prompt") or body_j.get("query")
     trace_name = request.headers.get("x-trace-name") or model or "llm-request"
     user_id    = request.headers.get("x-user-id") or None
     # Derived from the validated token, so a client cannot spoof it.
@@ -821,10 +899,12 @@ async def proxy(backend: str, rest: str, request: Request, background_tasks: Bac
 
     # ── Streaming ─────────────────────────────────────────────────────────────
     if is_stream:
-        if not is_responses_api:
+        if rest_key in CHAT_COMPLETIONS_STREAM_PATHS:
             # Ask the backend to include token usage in the final chunk.
-            # The Responses API always does this with no opt-in, and
-            # rejects unrecognized top-level fields like this one.
+            # Only done for paths known to accept this field — the
+            # Responses API and Ollama's native routes either already
+            # include usage with no opt-in, or might reject an
+            # unrecognized top-level field outright.
             body_j["stream_options"] = {"include_usage": True}
             body_b = json.dumps(body_j).encode()
 
@@ -856,18 +936,24 @@ async def proxy(backend: str, rest: str, request: Request, background_tasks: Bac
                 err_box[0] = str(e)
                 raise
             finally:
-                ms   = int((time.time() - start_ms) * 1000)
-                full = b"".join(collected)
+                ms     = int((time.time() - start_ms) * 1000)
+                full   = b"".join(collected)
                 parsed, usage_data = _parse_stream_buffer(full)
-                usage = _parse_usage(usage_data)
-                cost  = _compute_cost(backend_cfg, model, usage)
+                usage  = _parse_usage(usage_data)
+                cost   = _compute_cost(backend_cfg, model, usage)
+                output = _extract_output(parsed)
                 try:
+                    # Even when the connection errors out afterward, still
+                    # attach whatever output/usage/cost was actually parsed
+                    # from the bytes received so far. The backend may have
+                    # already generated -- and been billed for -- the full
+                    # completion before the connection hiccuped on the way
+                    # out; a real cost sitting right here shouldn't be
+                    # thrown away just because of what happened after it.
+                    span.set_attributes(_result_span_attrs(ms, output=output, usage=usage, cost=cost))
                     if err_box[0]:
-                        span.set_attributes(_result_span_attrs(ms))
                         span.set_status(Status(StatusCode.ERROR, description=err_box[0][:500]))
                     else:
-                        output = _extract_output(parsed)
-                        span.set_attributes(_result_span_attrs(ms, output=output, usage=usage, cost=cost))
                         span.set_status(Status(StatusCode.OK))
                     span.end()
                     _flush_phoenix(phx["provider"])
@@ -892,7 +978,7 @@ async def proxy(backend: str, rest: str, request: Request, background_tasks: Bac
             pass
 
         output = _extract_output(parsed)
-        usage  = _parse_usage(parsed.get("usage") if parsed else None)
+        usage  = _parse_usage(_find_usage_dict(parsed))
         cost   = _compute_cost(backend_cfg, model, usage)
 
         span.set_attributes(_result_span_attrs(ms, output=output, usage=usage, cost=cost, status_code=r.status_code))

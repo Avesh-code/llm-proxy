@@ -496,6 +496,30 @@
           </div>
         </form>
       </div>
+
+      <div class="card">
+        <h2>
+          <svg class="icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 13a7.4 7.4 0 0 0 0-2l2-1.5-2-3.4-2.3.9a7.6 7.6 0 0 0-1.7-1l-.3-2.5H9.9l-.3 2.5a7.6 7.6 0 0 0-1.7 1l-2.3-.9-2 3.4L5.6 11a7.4 7.4 0 0 0 0 2l-2 1.5 2 3.4 2.3-.9c.5.4 1.1.8 1.7 1l.3 2.5h4.2l.3-2.5a7.6 7.6 0 0 0 1.7-1l2.3.9 2-3.4-2-1.5Z"/></svg>
+          Allowed endpoints
+        </h2>
+        <p class="card-desc">
+          A request to a backend path outside this list is rejected with a 400 before it ever reaches the backend.
+          Enter a path exactly as a client would call it — leading "/" is optional, e.g. <code>v1/chat/completions</code> or <code>api/chat</code>.
+        </p>
+        <div class="checkboxes" id="endpoints-chips" style="margin-bottom:16px"></div>
+        <div class="row" style="max-width:420px">
+          <input type="text" id="new-endpoint-input" placeholder="e.g. v1/embeddings"
+                 onkeydown="if(event.key==='Enter'){event.preventDefault(); addEndpointChip();}">
+          <button type="button" onclick="addEndpointChip()">
+            <svg class="icon" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+            Add
+          </button>
+        </div>
+        <div class="divider"></div>
+        <div style="display:flex; justify-content:flex-end">
+          <button class="primary" onclick="saveEndpointSettings()">Save changes</button>
+        </div>
+      </div>
     </div>
   </main>
 </div>
@@ -505,6 +529,7 @@ const TOKEN_KEY = 'llmproxy_admin_token';
 const THEME_KEY = 'llmproxy_theme';
 let backendsCache = {};
 let teamsCache = {};
+let endpointsCache = [];
 let publicBaseUrl = null; // set via /health if PUBLIC_BASE_URL is configured server-side
 
 // ── Theme ─────────────────────────────────────────────────────────────────
@@ -895,6 +920,51 @@ async function saveSettings(ev) {
   } catch (e) { toast(e.message, false); }
 }
 
+// ── Settings (allowed endpoints) ─────────────────────────────────────────────
+async function loadEndpointSettings() {
+  const data = await api('/admin/api/settings/endpoints');
+  endpointsCache = data.llm_endpoints || [];
+  renderEndpoints();
+}
+
+function renderEndpoints() {
+  const box = document.getElementById('endpoints-chips');
+  box.innerHTML = endpointsCache.length ? endpointsCache.map(e => `
+    <label style="padding-right:4px; cursor:default">
+      <span class="mono">${esc(e)}</span>
+      <button type="button" class="ghost small" style="padding:0 0 0 4px" onclick="removeEndpointChip('${escAttr(e)}')" title="Remove">✕</button>
+    </label>
+  `).join('') : '<span style="color:var(--muted-2); font-size:12.5px">No endpoints configured — every request will be rejected. Add at least one below.</span>';
+}
+
+function addEndpointChip() {
+  const input = document.getElementById('new-endpoint-input');
+  const v = input.value.trim().replace(/^\/+/, '');
+  if (!v) return;
+  if (!endpointsCache.includes(v)) {
+    endpointsCache = [...endpointsCache, v].sort();
+    renderEndpoints();
+  }
+  input.value = '';
+  input.focus();
+}
+
+function removeEndpointChip(v) {
+  endpointsCache = endpointsCache.filter(e => e !== v);
+  renderEndpoints();
+}
+
+async function saveEndpointSettings() {
+  try {
+    const res = await api('/admin/api/settings/endpoints', {
+      method: 'PUT', body: JSON.stringify({ llm_endpoints: endpointsCache }),
+    });
+    endpointsCache = res.llm_endpoints;
+    renderEndpoints();
+    toast('Settings saved.');
+  } catch (e) { toast(e.message, false); }
+}
+
 // ── Misc ──────────────────────────────────────────────────────────────────
 function esc(s) { return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function escAttr(s) { return esc(s).replace(/"/g, '&quot;'); }
@@ -904,6 +974,7 @@ async function loadAll() {
     loadBackends(),
     loadTeams(),
     loadSettings(),
+    loadEndpointSettings(),
     fetch('/health').then(r => r.json()).then(h => { publicBaseUrl = h.public_base_url || null; }).catch(() => {}),
   ]);
 }
