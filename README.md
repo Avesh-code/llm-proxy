@@ -39,11 +39,20 @@ no redeploys to onboard a team or add a model server.
   Nothing is inferred from the `model` field — real model ids (e.g.
   `meta-llama/Llama-3-70b`) can themselves contain a `/`, so path-based
   routing is what stays unambiguous as you add more backends.
-- **Only known LLM endpoints are allowed through at all.** `v1/chat/completions`,
-  `v1/completions`, `v1/responses` (and their unprefixed variants) — anything
-  else gets a `400` instead of being silently forwarded untraced. This is a
-  proxy for LLM inference calls specifically, not a general-purpose reverse
-  proxy for whatever else a backend happens to expose.
+- **Only known LLM endpoints are allowed through at all.** By default that's
+  Chat Completions and the Responses API (`v1/chat/completions`,
+  `v1/completions`, `v1/responses`, and their unprefixed variants), Ollama's
+  native `api/chat`/`api/generate`, and `v1/rerank`/`rerank` — anything else
+  gets a `400` instead of being silently forwarded untraced. This is a proxy
+  for LLM inference calls specifically, not a general-purpose reverse proxy
+  for whatever else a backend happens to expose. The list itself is editable
+  live at `/admin` → **Settings**, not hardcoded — add or remove a path with
+  no code change or restart.
+- **Multiple API shapes are understood, not just OpenAI's.** Usage
+  (input/output tokens) and output are parsed correctly whether a backend
+  responds in Chat Completions' shape, the Responses API's, or Ollama's
+  native NDJSON streaming format (`prompt_eval_count`/`eval_count`) — cost
+  and tracing work the same regardless of which one a given backend speaks.
 - **Concurrency is capped per backend.** Each backend has a "max concurrent
   requests" limit (set in `/admin`, default 20) enforced with an
   `asyncio.Semaphore` — a burst of traffic to one backend queues past that
@@ -98,6 +107,11 @@ Open `http://<this-host>:4000/admin` and paste in `ADMIN_TOKEN`. From there:
    host/public key/secret key right there to turn on tracing for it.
 3. Hand the team its token (visible on its row, with a copy button) and point
    them at [Onboarding a team](#onboarding-a-team) below.
+4. **Settings** — the list of endpoint paths this proxy accepts
+   (`v1/chat/completions`, `api/chat`, `v1/rerank`, …) lives here, editable
+   as chips. Add a path if a backend speaks an LLM API shape not already on
+   the list; remove one to tighten what's allowed through. Applies instance-
+   wide, immediately, no restart.
 
 No backends or teams ship pre-configured — `backends.yaml` only holds
 commented-out examples. The proxy is designed to start empty.
@@ -168,7 +182,7 @@ isn't lost on `docker compose up -d --force-recreate` or an image rebuild.
 
 | Endpoint | Auth | Purpose |
 |---|---|---|
-| `POST/GET/... /<backend>/<path>` | team token | The actual proxy. Forwards to `<backend>`'s `base_url + /<path>` and traces it to that team's Langfuse project. Only known LLM-shaped paths are allowed — `v1/chat/completions`, `v1/completions`, `v1/responses` (and their unprefixed variants); anything else gets a `400`, not a silent untraced forward. |
+| `POST/GET/... /<backend>/<path>` | team token | The actual proxy. Forwards to `<backend>`'s `base_url + /<path>` and traces it to that team's Langfuse project. Only paths in the (admin-editable) endpoint allow-list are proxied — anything else gets a `400`, not a silent untraced forward. |
 | `GET /whoami` | team token | This team's allowed backends, their models, and a ready-to-run curl example. |
 | `GET /v1/models`, `GET /models` | team token | OpenAI-style model list, filtered to what this team's token can reach, including each model's `input_price_per_1m`/`output_price_per_1m`. |
 | `GET /health` | none | Liveness + a non-secret summary: backend names/types/models, team names/allowed-backends/tracing-on-off, `public_base_url`. |
@@ -176,6 +190,7 @@ isn't lost on `docker compose up -d --force-recreate` or an image rebuild.
 | `GET/PUT/DELETE /admin/api/backends[/{name}]` | admin token | Manage backends. `PUT` upserts (create or update); an empty `api_key` on update keeps the existing one. `max_concurrency` (default 20) caps requests in flight to that backend at once. |
 | `POST /admin/api/backends/{name}/test` | admin token | Probes a backend with its own model-listing route (`GET /v1/models` for OpenAI/vLLM/generic, `GET /api/tags` for Ollama) and returns what it finds. |
 | `GET/PUT/DELETE /admin/api/teams[/{name}]` | admin token | Manage teams. `PUT` upserts; blank `token` auto-generates one; blank `langfuse_secret_key` on update keeps the existing one. Deleting a backend still referenced by a team is refused (`409`) — remove it from the team(s) first. |
+| `GET/PUT /admin/api/settings` | admin token | Read or replace the endpoint allow-list (`llm_endpoints`) — which paths this proxy will proxy at all. `PUT` rejects an empty list (`400`), since that would lock out every request with no way back in except editing `data/config.json` by hand. |
 
 Bearer tokens are compared with a constant-time check (`hmac.compare_digest`)
 so a near-miss guess doesn't leak timing information.
@@ -302,11 +317,11 @@ team's row, or `GET /whoami` with its token.
 configured backend name. Check `/admin` → Backends, or `GET /health`.
 
 **A team gets `400 unsupported_endpoint`** — the path after the backend
-name isn't one this proxy traces (`v1/chat/completions`, `v1/completions`,
-`v1/responses`, or their unprefixed variants). This is intentional: the
-proxy only fronts LLM inference calls, not arbitrary paths a backend
-happens to expose. If a legitimate LLM API shape is missing from that list,
-it needs to be added in code (`LLM_ENDPOINTS` in `proxy.py`).
+name isn't on the endpoint allow-list. This is intentional: the proxy only
+fronts LLM inference calls, not arbitrary paths a backend happens to expose.
+If a legitimate LLM API shape is missing, add it at `/admin` → **Settings**
+— no code change or restart needed. The error message itself lists what's
+currently allowed.
 
 **"Test connection" fails in the admin UI** — the proxy container needs
 network access to that backend's `base_url`. If the backend is on the same
