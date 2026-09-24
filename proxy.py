@@ -44,7 +44,13 @@ DEFAULT_LLM_ENDPOINTS = [
     "v1/responses",        "responses",
     "api/chat",            "api/generate",
     "v1/rerank",           "rerank",
+    "v1/messages",         "messages",
 ]
+
+# Anthropic's API-format version, sent as the required `anthropic-version`
+# header on every request (not a model version -- it hasn't changed since
+# the Messages API's initial release, and covers every Claude model).
+ANTHROPIC_VERSION = "2023-06-01"
 
 # Legacy env vars — read once, only to seed data/config.json on first boot.
 # After that file exists, these are ignored; edit backends/teams/tracing via
@@ -411,7 +417,7 @@ class ModelPriceIn(BaseModel):
 
 
 class BackendIn(BaseModel):
-    type: str = "openai"        # openai | vllm | ollama | openai-compatible
+    type: str = "openai"        # openai | vllm | ollama | anthropic | openai-compatible
     base_url: str
     api_key: str = ""           # PUT with "" on an existing backend keeps the current key
     models: list[ModelPriceIn] = []
@@ -470,13 +476,19 @@ async def admin_test_backend(name: str, body: BackendIn):
     """
     Probes the backend with its own native model-listing route and returns
     what it finds, so the UI can offer "use these" instead of hand-typing a
-    model list. openai/vllm/openai-compatible speak GET /v1/models; ollama
-    speaks GET /api/tags.
+    model list. openai/vllm/openai-compatible/anthropic all speak
+    GET /v1/models (Anthropic's returns the same {"data": [...]} shape,
+    just needs its own auth headers); ollama speaks GET /api/tags.
     """
     base_url = body.base_url.rstrip("/")
     existing = store.data["backends"].get(name, {})
     api_key  = body.api_key or existing.get("api_key", "")
-    headers  = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    if body.type == "anthropic":
+        headers = {"anthropic-version": ANTHROPIC_VERSION}
+        if api_key:
+            headers["x-api-key"] = api_key
+    else:
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     try:
         if body.type == "ollama":
             r = await http_client.get(f"{base_url}/api/tags", headers=headers, timeout=10)
@@ -570,17 +582,26 @@ async def admin_update_settings(body: SettingsIn):
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
-def _fwd_headers(h: dict, api_key: str) -> dict:
+def _fwd_headers(h: dict, api_key: str, backend_type: str = "openai") -> dict:
     """
     Strip hop-by-hop headers and the caller's proxy token, then attach the
     real backend key (if that backend needs one). Their token must never
     reach a real backend.
+
+    Anthropic doesn't use OpenAI-style bearer auth at all -- it authenticates
+    with an `x-api-key` header and requires an `anthropic-version` header on
+    every request, so it gets its own branch here instead of the usual
+    `Authorization: Bearer` every other backend type uses.
     """
     out = dict(h)
     for k in ("host", "content-length", "transfer-encoding", "connection",
-              "authorization", "api-key", "x-api-key"):
+              "authorization", "api-key", "x-api-key", "anthropic-version"):
         out.pop(k, None)
-    if api_key:
+    if backend_type == "anthropic":
+        if api_key:
+            out["x-api-key"] = api_key
+        out["anthropic-version"] = ANTHROPIC_VERSION
+    elif api_key:
         out["authorization"] = f"Bearer {api_key}"
     return out
 
@@ -673,6 +694,10 @@ def _extract_output(parsed):
         return parsed["message"]
     if "response" in parsed:
         return parsed["response"]
+    # Anthropic Messages API: reply text lives in a list of content blocks
+    # (text/tool_use/...), not under "choices"/"output"/"message".
+    if "content" in parsed:
+        return parsed["content"]
     # Rerank (Cohere/vLLM/TEI-object-shaped): no generated text, just
     # ranked {index, relevance_score}/{index, score} items.
     if "results" in parsed:
@@ -687,7 +712,7 @@ def _log(method, path, status, ms, model, service):
 
 def _parse_stream_buffer(full_bytes: bytes) -> tuple:
     """
-    Parses a streamed response body regardless of which of these three
+    Parses a streamed response body regardless of which of these four
     shapes it's actually in — the proxy doesn't know in advance which one
     a given backend/endpoint uses:
     - Chat Completions (SSE, "data: {...}" lines): a bare
@@ -700,11 +725,22 @@ def _parse_stream_buffer(full_bytes: bytes) -> tuple:
     - Ollama native (NDJSON, no "data:" prefix — one raw JSON object per
       line): the final line (done: true) carries prompt_eval_count /
       eval_count and the assembled message directly at the top level.
+    - Anthropic Messages API (SSE, "data: {...}" lines): a sequence of
+      typed events with no single chunk carrying the full picture —
+      input_tokens arrives once on "message_start" (nested under
+      message.usage), output_tokens is only ever a running total on each
+      "message_delta" (so the last one wins), and the reply text itself
+      arrives as incremental "content_block_delta" fragments that have to
+      be concatenated back into one string, unlike every other shape here
+      where some single chunk already holds the complete text.
 
     Returns (last_relevant_chunk_parsed, usage_dict_or_None).
     """
     parsed     = None
     usage_data = None
+    anthropic_input_tokens  = None
+    anthropic_output_tokens = None
+    anthropic_text          = []
     for line in full_bytes.decode(errors="ignore").splitlines():
         line = line.strip()
         if not line or "[DONE]" in line:
@@ -728,6 +764,19 @@ def _parse_stream_buffer(full_bytes: bytes) -> tuple:
             usage_data = chunk_json
         if "message" in chunk_json or ("response" in chunk_json and not isinstance(response_obj, dict)):
             parsed = chunk_json
+        message_obj = chunk_json.get("message")
+        if isinstance(message_obj, dict) and isinstance(message_obj.get("usage"), dict):
+            anthropic_input_tokens = message_obj["usage"].get("input_tokens", anthropic_input_tokens)
+            anthropic_output_tokens = message_obj["usage"].get("output_tokens", anthropic_output_tokens)
+        if chunk_json.get("type") == "message_delta" and isinstance(chunk_json.get("usage"), dict):
+            anthropic_output_tokens = chunk_json["usage"].get("output_tokens", anthropic_output_tokens)
+        delta_obj = chunk_json.get("delta")
+        if isinstance(delta_obj, dict) and delta_obj.get("type") == "text_delta":
+            anthropic_text.append(delta_obj.get("text", ""))
+    if anthropic_input_tokens is not None or anthropic_output_tokens is not None:
+        usage_data = {"input_tokens": anthropic_input_tokens or 0, "output_tokens": anthropic_output_tokens or 0}
+    if anthropic_text:
+        parsed = {"content": [{"type": "text", "text": "".join(anthropic_text)}]}
     return parsed, usage_data
 
 
@@ -762,7 +811,7 @@ async def proxy(backend: str, rest: str, request: Request, background_tasks: Bac
 
     backend_cfg = BACKENDS[backend]
     url     = f"{backend_cfg['base_url']}/{rest}"
-    headers = _fwd_headers(dict(request.headers), backend_cfg["api_key"])
+    headers = _fwd_headers(dict(request.headers), backend_cfg["api_key"], backend_cfg.get("type", "openai"))
     body_b  = await request.body()
     rest_key = rest.lstrip("/")
     is_llm   = rest_key in LLM_ENDPOINTS

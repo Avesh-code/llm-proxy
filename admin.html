@@ -27,6 +27,8 @@
     --ok-soft: #e8f8f0;
     --warn: #b7791f;
     --warn-soft: #fbf3e2;
+    --anthropic: #c15f3c;
+    --anthropic-soft: #fbece4;
     --input-bg: #ffffff;
     --shadow: 0 1px 2px rgba(20,22,30,.04), 0 8px 24px -12px rgba(20,22,30,.10);
     --shadow-lg: 0 12px 40px -12px rgba(20,22,30,.22);
@@ -42,6 +44,7 @@
       --muted-2: #6b7182; --accent: #6b87ff; --accent-hover: #8199ff; --accent-soft: #1c2340;
       --accent-text: #0b0d12; --danger: #ff6b81; --danger-soft: #2a1620; --ok: #3ddc97;
       --ok-soft: #12291f; --warn: #f2c14e; --warn-soft: #2b2311; --input-bg: #12151c;
+      --anthropic: #e08160; --anthropic-soft: #34201a;
       --shadow: 0 1px 2px rgba(0,0,0,.3), 0 8px 24px -12px rgba(0,0,0,.5);
       --shadow-lg: 0 20px 60px -16px rgba(0,0,0,.6); --ring: 0 0 0 3px rgba(107,135,255,.25);
     }
@@ -52,6 +55,7 @@
     --muted-2: #6b7182; --accent: #6b87ff; --accent-hover: #8199ff; --accent-soft: #1c2340;
     --accent-text: #0b0d12; --danger: #ff6b81; --danger-soft: #2a1620; --ok: #3ddc97;
     --ok-soft: #12291f; --warn: #f2c14e; --warn-soft: #2b2311; --input-bg: #12151c;
+    --anthropic: #e08160; --anthropic-soft: #34201a;
     --shadow: 0 1px 2px rgba(0,0,0,.3), 0 8px 24px -12px rgba(0,0,0,.5);
     --shadow-lg: 0 20px 60px -16px rgba(0,0,0,.6); --ring: 0 0 0 3px rgba(107,135,255,.25);
   }
@@ -162,6 +166,8 @@
   .type-vllm .dot { background: var(--accent); }
   .type-ollama { background: var(--warn-soft); color: var(--warn); }
   .type-ollama .dot { background: var(--warn); }
+  .type-anthropic { background: var(--anthropic-soft); color: var(--anthropic); }
+  .type-anthropic .dot { background: var(--anthropic); }
   .type-openai-compatible { background: var(--bg-soft); color: var(--muted); }
   .type-openai-compatible .dot { background: var(--muted-2); }
 
@@ -377,6 +383,7 @@
                 <option value="openai-compatible">OpenAI-compatible (generic)</option>
                 <option value="vllm">vLLM</option>
                 <option value="ollama">Ollama</option>
+                <option value="anthropic">Anthropic</option>
               </select>
             </div>
           </div>
@@ -636,7 +643,7 @@ async function saveSettings() {
 }
 
 // ── Backends ──────────────────────────────────────────────────────────────
-const TYPE_LABEL = { openai: 'OpenAI', vllm: 'vLLM', ollama: 'Ollama', 'openai-compatible': 'Compatible' };
+const TYPE_LABEL = { openai: 'OpenAI', vllm: 'vLLM', ollama: 'Ollama', anthropic: 'Anthropic', 'openai-compatible': 'Compatible' };
 
 async function loadBackends() {
   backendsCache = await api('/admin/api/backends');
