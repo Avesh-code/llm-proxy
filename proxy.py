@@ -261,6 +261,25 @@ def _get_langfuse(team: str) -> Langfuse:
 for _team_name in store.data["teams"]:
     _reinit_team_langfuse(_team_name)
 
+
+def _flush_langfuse_background(langfuse: Langfuse):
+    """
+    langfuse.flush() is synchronous -- it blocks the calling thread until
+    pending spans are exported, including Langfuse's own internal retry/
+    backoff loop on a failed export. Called directly from the request path,
+    that means an unreachable Langfuse host doesn't just fail to trace --
+    it blocks this process's single event loop, stalling every other
+    request being served concurrently, not just the one being flushed.
+    Running it in a worker thread keeps a dead tracing backend from ever
+    being able to affect real traffic, which synchronous flush() calls in
+    the request path could not guarantee.
+    """
+    try:
+        asyncio.get_running_loop().run_in_executor(None, langfuse.flush)
+    except Exception as e:
+        print(f"Langfuse error: {e}", flush=True)
+
+
 # ── httpx ─────────────────────────────────────────────────────────────────────
 HTTPX_TIMEOUT = httpx.Timeout(connect=30.0, read=float(PROXY_TIMEOUT), write=60.0, pool=10.0)
 http_client: httpx.AsyncClient = None
@@ -937,7 +956,7 @@ async def proxy(backend: str, rest: str, request: Request, background_tasks: Bac
                         root_span.update(output=output, metadata={"latency_ms": ms})
                     gen_span.end()
                     root_span.end()
-                    langfuse.flush()
+                    _flush_langfuse_background(langfuse)
                 except Exception as e:
                     print(f"Langfuse error: {e}", flush=True)
                 _log(request.method, f"{backend}/{rest}", "stream", ms, model, service)
@@ -989,10 +1008,7 @@ async def proxy(backend: str, rest: str, request: Request, background_tasks: Bac
                         metadata       = {"latency_ms": ms, "status_code": r.status_code},
                     )
                     root_span.update(output=output, level=level, metadata={"latency_ms": ms})
-                    try:
-                        langfuse.flush()
-                    except Exception as e:
-                        print(f"Langfuse error: {e}", flush=True)
+                    _flush_langfuse_background(langfuse)
 
                     _log(request.method, f"{backend}/{rest}", r.status_code, ms, model, service)
                     return Response(content=r.content, status_code=r.status_code,
@@ -1002,10 +1018,7 @@ async def proxy(backend: str, rest: str, request: Request, background_tasks: Bac
                     ms = int((time.time() - start_ms) * 1000)
                     gen_span.update(level="ERROR", status_message=str(e), metadata={"latency_ms": ms})
                     root_span.update(level="ERROR", metadata={"latency_ms": ms})
-                    try:
-                        langfuse.flush()
-                    except Exception:
-                        pass
+                    _flush_langfuse_background(langfuse)
                     print(f"Proxy error: {e}", flush=True)
                     return JSONResponse(status_code=502, content={"error": "proxy_error", "message": str(e)})
 
