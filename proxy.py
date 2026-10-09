@@ -262,6 +262,17 @@ for _team_name in store.data["teams"]:
     _reinit_team_langfuse(_team_name)
 
 
+def _log_background_flush_result(future: "asyncio.Future"):
+    # run_in_executor's Future silently swallows an exception raised inside
+    # the worker thread unless something actually inspects it -- without
+    # this callback, a failed export (e.g. the Langfuse host being down)
+    # would fail completely invisibly, with no log line at all, which
+    # makes "the trace never showed up" impossible to diagnose.
+    exc = future.exception()
+    if exc is not None:
+        print(f"Langfuse error: {exc}", flush=True)
+
+
 def _flush_langfuse_background(langfuse: Langfuse):
     """
     langfuse.flush() is synchronous -- it blocks the calling thread until
@@ -275,7 +286,8 @@ def _flush_langfuse_background(langfuse: Langfuse):
     the request path could not guarantee.
     """
     try:
-        asyncio.get_running_loop().run_in_executor(None, langfuse.flush)
+        future = asyncio.get_running_loop().run_in_executor(None, langfuse.flush)
+        future.add_done_callback(_log_background_flush_result)
     except Exception as e:
         print(f"Langfuse error: {e}", flush=True)
 
