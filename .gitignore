@@ -8,6 +8,10 @@
 # the proxy-data volume in docker-compose.yml.
 data/
 
+#logs 
+stream.txt
+non-stream.txt
+
 # Python
 __pycache__/
 *.pyc
