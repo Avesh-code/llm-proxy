@@ -1,4 +1,4 @@
-# LLM Proxy
+# AI-Gateway
 
 A single, self-hosted entry point for every LLM your org uses — OpenAI, vLLM,
 Ollama, or anything else that speaks the OpenAI API. Each team gets its own
@@ -10,7 +10,7 @@ no redeploys to onboard a team or add a model server.
 
 ```
  developers / team A  ──┐
- developers / team B  ──┼──►  LLM Proxy  ──┬──►  OpenAI
+ developers / team B  ──┼──►  AI-Gateway ──┬──►  OpenAI
  developers / team C  ──┘     :4000        ├──►  vLLM  (self-hosted)
                                │            └──►  Ollama (self-hosted)
                                │
