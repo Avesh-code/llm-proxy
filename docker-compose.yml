@@ -1,10 +1,10 @@
 services:
-  langfuse-proxy:
+  ai-gateway:
     build:
       context: .
       dockerfile: Dockerfile
-    image: langfuse-ai-proxy:latest
-    container_name: langfuse-proxy
+    image: ai-gateway:latest
+    container_name: AI-Gateway
     restart: unless-stopped
 
     # Bound to localhost. Change to "${PROXY_PORT:-4000}:4000" to expose it on
