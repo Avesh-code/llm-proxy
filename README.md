@@ -299,7 +299,7 @@ docker compose up -d --build
   monitoring at the same endpoint.
 - **Logs**: `docker-compose.yml` caps `json-file` logs at 10 MB × 3 files.
   Every proxied request logs one line — method, path, status, latency,
-  model, team — to stdout (`docker logs -f langfuse-proxy`).
+  model, team — to stdout (`docker logs -f AI-Gateway`).
 - **Rotating a backend's API key**: update it on that backend's card in
   `/admin` — takes effect on the next request, no restart.
 - **Revoking a team**: delete it in `/admin` → Teams. Its token stops
