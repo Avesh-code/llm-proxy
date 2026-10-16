@@ -5,6 +5,7 @@ import time
 import hmac
 import secrets
 import asyncio
+import threading
 from pathlib import Path
 
 import httpx
@@ -264,7 +265,21 @@ def _build_phoenix_tracer(team_name: str) -> dict:
 
 
 def _reinit_team_tracer(team: str):
+    old = _PHOENIX_TRACERS.get(team)
     _PHOENIX_TRACERS[team] = _build_phoenix_tracer(team)
+    # Flush what the replaced provider still had queued and stop its export
+    # thread, off the request path -- otherwise every settings save leaked a
+    # background exporter that kept running with the old endpoint/key.
+    shutdown = getattr(old and old["provider"], "shutdown", None)
+    if shutdown:
+        threading.Thread(target=_shutdown_quietly, args=(shutdown,), daemon=True).start()
+
+
+def _shutdown_quietly(fn):
+    try:
+        fn()
+    except Exception as e:
+        print(f"Phoenix export error: {e}", flush=True)
 
 
 def _reinit_all_tracers():
@@ -282,13 +297,95 @@ def _get_phoenix(team: str) -> dict:
     return entry
 
 
-def _flush_phoenix(provider):
+def _flush_phoenix_sync(provider):
     try:
         flush = getattr(provider, "force_flush", None)
         if flush:
             flush(timeout_millis=5000)
     except Exception as e:
         print(f"Phoenix export error: {e}", flush=True)
+
+
+def _log_background_flush_result(future: "asyncio.Future"):
+    # run_in_executor's Future silently swallows an exception raised inside
+    # the worker thread unless something actually inspects it.
+    exc = future.exception()
+    if exc is not None:
+        print(f"Phoenix export error: {exc}", flush=True)
+
+
+def _flush_phoenix(provider):
+    """
+    force_flush() is synchronous -- it blocks the calling thread for up to
+    its 5s timeout while pending spans are exported. Called directly from
+    the request path, a slow or unreachable Phoenix would block this
+    process's single event loop, stalling every request being served, not
+    just the one being traced. Running it in a worker thread keeps a dead
+    tracing backend from ever being able to affect real traffic.
+    """
+    try:
+        future = asyncio.get_running_loop().run_in_executor(None, _flush_phoenix_sync, provider)
+        future.add_done_callback(_log_background_flush_result)
+    except RuntimeError:
+        # No running loop (e.g. app shutdown) -- flush inline.
+        _flush_phoenix_sync(provider)
+    except Exception as e:
+        print(f"Phoenix export error: {e}", flush=True)
+
+
+def _install_trace_export_log():
+    """
+    Logs one line per batch uploaded to Phoenix -- OK or FAILED, which
+    team(s), how many traces/spans, how long it took, and the trace ids.
+    Wraps the uploader's public export() method rather than replacing the
+    uploader, so auth, endpoint and batching are untouched.
+    Set LOG_TRACE_EXPORTS=false to turn it off.
+    """
+    if os.getenv("LOG_TRACE_EXPORTS", "true").lower() in ("false", "0", "no"):
+        return
+    try:
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+        from opentelemetry.sdk.trace.export import SpanExportResult
+    except Exception as e:
+        print(f"Phoenix: trace export logging unavailable: {e}", flush=True)
+        return
+    if getattr(OTLPSpanExporter.export, "_proxy_logged", False):
+        return
+    original_export = OTLPSpanExporter.export
+
+    def export(self, spans, *args, **kwargs):
+        started = time.time()
+        try:
+            result = original_export(self, spans, *args, **kwargs)
+        except Exception as e:
+            result, error = None, e
+        else:
+            error = None
+        ms = int((time.time() - started) * 1000)
+        try:
+            spans = list(spans)
+            trace_ids = sorted({format(s.context.trace_id, "032x") for s in spans})
+            teams = sorted({str((s.attributes or {}).get("proxy.service")) for s in spans
+                            if (s.attributes or {}).get("proxy.service")}) or ["?"]
+            ok = error is None and result == SpanExportResult.SUCCESS
+            ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            print(f"[{ts}] TRACE {'OK' if ok else 'FAILED'} | team={','.join(teams)} | "
+                  f"{len(trace_ids)} trace(s), {len(spans)} span(s) | {ms}ms | "
+                  f"-> {getattr(self, '_endpoint', '?')}"
+                  + (f" | error={error}" if error else "")
+                  + f" | trace_id={','.join(trace_ids[:5])}"
+                  + (f",... (+{len(trace_ids) - 5} more)" if len(trace_ids) > 5 else ""), flush=True)
+        except Exception:
+            pass
+        if error is not None:
+            raise error
+        return result
+
+    export._proxy_logged = True
+    OTLPSpanExporter.export = export
+
+
+_install_trace_export_log()
 
 
 def _team_tracing_enabled(name: str) -> bool:
@@ -330,7 +427,7 @@ Health check:            http://<this-host>:{PROXY_PORT}/health
     yield
     await http_client.aclose()
     for _entry in _PHOENIX_TRACERS.values():
-        _flush_phoenix(_entry["provider"])
+        _flush_phoenix_sync(_entry["provider"])
 
 
 app = FastAPI(lifespan=lifespan)
@@ -684,8 +781,18 @@ def _parse_usage(usage):
     """
     if not usage:
         return None
-    input_tok  = usage.get("prompt_tokens", usage.get("input_tokens", usage.get("prompt_eval_count", 0)))
-    output_tok = usage.get("completion_tokens", usage.get("output_tokens", usage.get("eval_count", 0)))
+
+    def first(*keys):
+        # First count that's actually present and non-null -- some servers
+        # send e.g. "prompt_tokens": null, which used to become None and then
+        # break the cost arithmetic.
+        for k in keys:
+            if usage.get(k) is not None:
+                return usage[k]
+        return 0
+
+    input_tok  = first("prompt_tokens", "input_tokens", "prompt_eval_count")
+    output_tok = first("completion_tokens", "output_tokens", "eval_count")
     total_tok  = usage.get("total_tokens") or (input_tok + output_tok)
     return {"input": input_tok, "output": output_tok, "total": total_tok}
 
@@ -704,7 +811,12 @@ def _compute_cost(backend_cfg: dict, model: str, usage: dict):
     """
     if not usage:
         return None
-    price = next((m for m in backend_cfg.get("models", []) if m.get("id") == model), None)
+    models = backend_cfg.get("models", [])
+    price = next((m for m in models if m.get("id") == model), None)
+    if price is None and isinstance(model, str):
+        # "GLM-5.3-Flash" vs a configured "glm-5.3-flash" is the same model;
+        # an exact match above still wins when both exist.
+        price = next((m for m in models if str(m.get("id", "")).lower() == model.lower()), None)
     if not price:
         return None
     input_price  = price.get("input_price")  or 0.0
@@ -941,11 +1053,18 @@ async def proxy(backend: str, rest: str, request: Request, background_tasks: Bac
                 raise
             finally:
                 ms     = int((time.time() - start_ms) * 1000)
-                full   = b"".join(collected)
-                parsed, usage_data = _parse_stream_buffer(full)
-                usage  = _parse_usage(usage_data)
-                cost   = _compute_cost(backend_cfg, model, usage)
-                output = _extract_output(parsed)
+                try:
+                    # Parsed inside the try: a malformed stream must not be
+                    # able to skip the span.end() below and leave the trace
+                    # open (and so never exported).
+                    full   = b"".join(collected)
+                    parsed, usage_data = _parse_stream_buffer(full)
+                    usage  = _parse_usage(usage_data)
+                    cost   = _compute_cost(backend_cfg, model, usage)
+                    output = _extract_output(parsed)
+                except Exception as e:
+                    print(f"Phoenix error: could not parse stream for tracing: {e}", flush=True)
+                    output, usage, cost = None, None, None
                 try:
                     # Even when the connection errors out afterward, still
                     # attach whatever output/usage/cost was actually parsed
