@@ -437,7 +437,11 @@ async def admin_test_backend(name: str, body: BackendIn):
         else:
             r = await http_client.get(f"{base_url}/v1/models", headers=headers, timeout=10)
             r.raise_for_status()
-            models = sorted(m["id"] for m in r.json().get("data", []))
+            # Most servers wrap the list as {"data": [...]}; some OpenAI-
+            # compatible ones (e.g. Together AI) return the bare list.
+            data  = r.json()
+            items = data if isinstance(data, list) else data.get("data", [])
+            models = sorted(m["id"] for m in items)
         return {"ok": True, "models": models}
     except Exception as e:
         return {"ok": False, "error": str(e)}
