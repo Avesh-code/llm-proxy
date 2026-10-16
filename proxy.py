@@ -354,6 +354,74 @@ for _team_name in store.data["teams"]:
     _reinit_team_langfuse(_team_name)
 
 
+def _span_team(span) -> str:
+    # The root span carries metadata={"service": team, ...}; the SDK stores
+    # metadata either flattened per key or as one JSON blob depending on version.
+    attrs = span.attributes or {}
+    team = attrs.get("langfuse.observation.metadata.service")
+    if team is None and attrs.get("langfuse.observation.metadata"):
+        try:
+            team = json.loads(attrs["langfuse.observation.metadata"]).get("service")
+        except Exception:
+            team = None
+    return str(team).strip('"') if team else ""
+
+
+def _install_trace_export_log():
+    """
+    Logs one line per batch the Langfuse SDK uploads -- OK or FAILED, which
+    team(s), how many traces/spans, how long it took, and the trace ids (paste
+    one into Langfuse's search to jump straight to it). Wraps the uploader's
+    public export() method rather than replacing the uploader, so the SDK's
+    own auth, endpoint, compression and batching are untouched.
+    Set LOG_TRACE_EXPORTS=false to turn it off.
+    """
+    if os.getenv("LOG_TRACE_EXPORTS", "true").lower() in ("false", "0", "no"):
+        return
+    try:
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+        from opentelemetry.sdk.trace.export import SpanExportResult
+    except Exception as e:
+        print(f"Langfuse: trace export logging unavailable: {e}", flush=True)
+        return
+    if getattr(OTLPSpanExporter.export, "_proxy_logged", False):
+        return
+    original_export = OTLPSpanExporter.export
+
+    def export(self, spans, *args, **kwargs):
+        started = time.time()
+        try:
+            result = original_export(self, spans, *args, **kwargs)
+        except Exception as e:
+            result, error = None, e
+        else:
+            error = None
+        ms = int((time.time() - started) * 1000)
+        try:
+            spans = list(spans)
+            trace_ids = sorted({format(s.context.trace_id, "032x") for s in spans})
+            teams = sorted({t for t in (_span_team(s) for s in spans) if t}) or ["?"]
+            ok = error is None and result == SpanExportResult.SUCCESS
+            ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            print(f"[{ts}] TRACE {'OK' if ok else 'FAILED'} | team={','.join(teams)} | "
+                  f"{len(trace_ids)} trace(s), {len(spans)} span(s) | {ms}ms | "
+                  f"-> {getattr(self, '_endpoint', '?')}"
+                  + (f" | error={error}" if error else "")
+                  + f" | trace_id={','.join(trace_ids[:5])}"
+                  + (f",... (+{len(trace_ids) - 5} more)" if len(trace_ids) > 5 else ""), flush=True)
+        except Exception:
+            pass
+        if error is not None:
+            raise error
+        return result
+
+    export._proxy_logged = True
+    OTLPSpanExporter.export = export
+
+
+_install_trace_export_log()
+
+
 def _log_background_flush_result(future: "asyncio.Future"):
     # run_in_executor's Future silently swallows an exception raised inside
     # the worker thread unless something actually inspects it -- without

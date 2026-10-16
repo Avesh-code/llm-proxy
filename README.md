@@ -156,6 +156,7 @@ committed — `.env` is gitignored.
 | `PROXY_PORT` | no | `4000` | Port the app listens on inside the container. |
 | `PROXY_TIMEOUT` | no | `600` | Seconds to wait for a backend response (kept long for slow local inference). |
 | `PUBLIC_BASE_URL` | no | — | The domain teams actually use, e.g. `https://llm.company.com`. Used verbatim in `/whoami`'s curl examples and the admin UI's, instead of guessing from request headers. Set this once you have a real domain. |
+| `LOG_TRACE_EXPORTS` | no | `true` | Log one `TRACE OK` / `TRACE FAILED` line per batch uploaded to Langfuse (team, trace ids, latency). `docker logs -f AI-Gateway \| grep TRACE` to watch them. |
 | `CONFIG_DATA_PATH` | no | `data/config.json` | Where the live backend/team/tracing config is persisted. Mounted as a volume in `docker-compose.yml` so it survives container recreation. |
 | `CONFIG_PATH` | no | `backends.yaml` | One-time migration seed, read **only** if `CONFIG_DATA_PATH` doesn't exist yet. |
 | `OPENAI_API_KEY`, `LANGFUSE_HOST`, `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, `TOKEN_TEAM_*`, … | no | — | Only consulted during that one-time migration, to seed backends/teams that `backends.yaml` names with `api_key_env` / `token_env`. Irrelevant once `data/config.json` exists — use `/admin` instead. |
