@@ -13,7 +13,16 @@ from fastapi import FastAPI, Request, Response, BackgroundTasks, Depends, HTTPEx
 from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
 from pydantic import BaseModel
 from langfuse import Langfuse, propagate_attributes
+from opentelemetry.sdk.trace import TracerProvider
+try:
+    # Private to the SDK -- only used to drop its per-public-key cache when a
+    # team's Langfuse keys change. If a future SDK moves it, key changes just
+    # need a restart again, as before.
+    from langfuse._client.resource_manager import LangfuseResourceManager
+except Exception:
+    LangfuseResourceManager = None
 from contextlib import asynccontextmanager
+import threading
 import uvicorn
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -234,20 +243,103 @@ def require_admin(request: Request):
 # separate code path in the proxy handler below.
 _LANGFUSE_CLIENTS: dict = {}
 
+# The Langfuse SDK caches its exporter per public_key for the life of the
+# process: a second Langfuse(...) with the same public_key silently reuses
+# the first one's host/secret/enabled state. So an admin fixing a team's
+# secret key or host (same public key) would otherwise change nothing until
+# a restart. Each public key therefore gets its own TracerProvider here,
+# tracked with the host/secret it was built for; when those change, the old
+# provider is shut down, the SDK's cached entry is dropped, and a fresh one
+# is built. A per-key provider also means one team's flush() only waits on
+# its own Langfuse project, not on every team's.
+_LANGFUSE_PROVIDERS: dict = {}   # public_key -> {"sig": (host, secret_key), "provider": TracerProvider}
 
-def _build_langfuse(cfg: dict) -> Langfuse:
+
+def _langfuse_host(cfg: dict) -> str:
+    # A trailing "/" makes the SDK post to "<host>//api/public/otel/...",
+    # which Langfuse answers with a 308 redirect on every export.
+    return (cfg.get("host") or "").strip().rstrip("/")
+
+
+def _evict_sdk_cache(public_key: str) -> bool:
+    """Drops the SDK's cached exporter for this public key, shutting it down
+    in the background. False if the SDK internals aren't reachable -- the
+    caller then keeps the existing exporter (the pre-fix behaviour: new keys
+    apply after a restart) rather than wiring a team to a dead one."""
+    try:
+        if LangfuseResourceManager is None:
+            raise RuntimeError("langfuse SDK internals not available")
+        with LangfuseResourceManager._lock:
+            stale = LangfuseResourceManager._instances.pop(public_key, None)
+    except Exception as e:
+        print(f"Langfuse error: could not reset cached client for {public_key} "
+              f"(restart to apply new keys): {e}", flush=True)
+        return False
+    if stale is not None:
+        threading.Thread(target=_shutdown_quietly, args=(stale.shutdown,), daemon=True).start()
+    return True
+
+
+def _shutdown_quietly(fn):
+    try:
+        fn()
+    except Exception as e:
+        print(f"Langfuse error: {e}", flush=True)
+
+
+def _build_langfuse(cfg: dict, replace: bool = False) -> Langfuse:
+    """replace=True only for an admin save of this team: its host/secret then
+    take over the exporter for its public key. Every other build (startup,
+    other teams sharing the key) reuses the existing exporter as-is -- the SDK
+    can only hold one per public key, so two teams saved with different
+    secrets for the same key must not keep replacing each other's."""
     cfg = cfg or {}
-    enabled = bool(cfg.get("enabled") and cfg.get("host") and cfg.get("public_key") and cfg.get("secret_key"))
+    host = _langfuse_host(cfg)
+    public_key = cfg.get("public_key") or ""
+    secret_key = cfg.get("secret_key") or ""
+    enabled = bool(cfg.get("enabled") and host and public_key and secret_key)
+    if not enabled:
+        # Never under the team's real public key: the SDK would cache a
+        # tracing-disabled exporter for it, and turning tracing on later
+        # would keep silently reusing that.
+        return Langfuse(public_key="disabled", secret_key="disabled",
+                        host="http://localhost", tracing_enabled=False)
+    sig = (host, secret_key)
+    state = _LANGFUSE_PROVIDERS.get(public_key)
+    if state is None or (replace and state["sig"] != sig):
+        if _evict_sdk_cache(public_key):
+            if state is not None:
+                # Flush what the old keys still had queued, then stop that
+                # exporter so it can't keep re-sending with stale credentials.
+                threading.Thread(target=_shutdown_quietly, args=(state["provider"].shutdown,),
+                                 daemon=True).start()
+            state = {"sig": sig, "provider": TracerProvider()}
+            _LANGFUSE_PROVIDERS[public_key] = state
+        elif state is None:
+            state = {"sig": sig, "provider": TracerProvider()}
+            _LANGFUSE_PROVIDERS[public_key] = state
     return Langfuse(
-        public_key=cfg.get("public_key") or "disabled",
-        secret_key=cfg.get("secret_key") or "disabled",
-        host=cfg.get("host") or "http://localhost",
-        tracing_enabled=enabled,
+        public_key=public_key,
+        secret_key=secret_key,
+        host=host,
+        tracing_enabled=True,
+        tracer_provider=state["provider"],
     )
 
 
-def _reinit_team_langfuse(team: str):
-    _LANGFUSE_CLIENTS[team] = _build_langfuse(store.data["teams"].get(team, {}).get("langfuse"))
+def _reinit_team_langfuse(team: str, replace: bool = False):
+    cfg = store.data["teams"].get(team, {}).get("langfuse") or {}
+    public_key = cfg.get("public_key") or ""
+    before = _LANGFUSE_PROVIDERS.get(public_key, {}).get("provider")
+    _LANGFUSE_CLIENTS[team] = _build_langfuse(cfg, replace=replace)
+    after = _LANGFUSE_PROVIDERS.get(public_key, {}).get("provider")
+    # If that rebuilt the exporter for this public key, any other team
+    # sharing the key still holds a client wired to the old (now shut down)
+    # one -- rebuild those too, against the new exporter.
+    if before is not None and after is not before:
+        for other, other_cfg in store.data["teams"].items():
+            if other != team and (other_cfg.get("langfuse") or {}).get("public_key") == public_key:
+                _LANGFUSE_CLIENTS[other] = _build_langfuse(other_cfg.get("langfuse"))
 
 
 def _get_langfuse(team: str) -> Langfuse:
@@ -290,7 +382,6 @@ def _flush_langfuse_background(langfuse: Langfuse):
         future.add_done_callback(_log_background_flush_result)
     except Exception as e:
         print(f"Langfuse error: {e}", flush=True)
-
 
 # ── httpx ─────────────────────────────────────────────────────────────────────
 HTTPX_TIMEOUT = httpx.Timeout(connect=30.0, read=float(PROXY_TIMEOUT), write=60.0, pool=10.0)
@@ -578,7 +669,7 @@ async def admin_upsert_team(name: str, body: TeamIn):
     store.data["teams"][name] = {"token": token, "backends": body.backends, "langfuse": langfuse_cfg}
     await store.save()
     _rebuild_indexes()
-    _reinit_team_langfuse(name)
+    _reinit_team_langfuse(name, replace=True)
     return {"ok": True, "name": name, "token": token, "tracing_enabled": langfuse_cfg["enabled"]}
 
 
@@ -675,13 +766,34 @@ def _parse_usage(usage):
     - Responses API:       input_tokens / output_tokens
     - Ollama (native):     prompt_eval_count / eval_count
     Accept any of them.
+
+    Anthropic also reports prompt-cache tokens separately from input_tokens
+    (cache_read_input_tokens / cache_creation_input_tokens); those are kept
+    as their own usage keys so they're counted and priced, not dropped.
     """
     if not usage:
         return None
-    input_tok  = usage.get("prompt_tokens", usage.get("input_tokens", usage.get("prompt_eval_count", 0)))
-    output_tok = usage.get("completion_tokens", usage.get("output_tokens", usage.get("eval_count", 0)))
-    total_tok  = usage.get("total_tokens") or (input_tok + output_tok)
-    return {"input": input_tok, "output": output_tok, "total": total_tok}
+
+    def first(*keys):
+        # First count that's actually present and non-null -- some servers
+        # send e.g. "prompt_tokens": null, which used to become None and then
+        # break the cost arithmetic.
+        for k in keys:
+            if usage.get(k) is not None:
+                return usage[k]
+        return 0
+
+    input_tok  = first("prompt_tokens", "input_tokens", "prompt_eval_count")
+    output_tok = first("completion_tokens", "output_tokens", "eval_count")
+    cache_read  = usage.get("cache_read_input_tokens") or 0
+    cache_write = usage.get("cache_creation_input_tokens") or 0
+    total_tok  = usage.get("total_tokens") or (input_tok + output_tok + cache_read + cache_write)
+    out = {"input": input_tok, "output": output_tok, "total": total_tok}
+    if cache_read:
+        out["cache_read_input_tokens"] = cache_read
+    if cache_write:
+        out["cache_creation_input_tokens"] = cache_write
+    return out
 
 
 def _compute_cost(backend_cfg: dict, model: str, usage: dict):
@@ -700,7 +812,12 @@ def _compute_cost(backend_cfg: dict, model: str, usage: dict):
     """
     if not usage:
         return None
-    price = next((m for m in backend_cfg.get("models", []) if m.get("id") == model), None)
+    models = backend_cfg.get("models", [])
+    price = next((m for m in models if m.get("id") == model), None)
+    if price is None and isinstance(model, str):
+        # "GLM-5.3-Flash" vs a configured "glm-5.3-flash" is the same model;
+        # an exact match above still wins when both exist.
+        price = next((m for m in models if str(m.get("id", "")).lower() == model.lower()), None)
     if not price:
         return None
     input_price  = price.get("input_price")  or 0.0
@@ -709,7 +826,17 @@ def _compute_cost(backend_cfg: dict, model: str, usage: dict):
         return None
     input_cost  = round((usage["input"]  / 1_000_000) * input_price,  8)
     output_cost = round((usage["output"] / 1_000_000) * output_price, 8)
-    return {"input": input_cost, "output": output_cost, "total": round(input_cost + output_cost, 8)}
+    cost = {"input": input_cost, "output": output_cost}
+    # Anthropic prompt caching, priced off the model's input price at
+    # Anthropic's standard rates: cache reads 0.1x, (5-minute) cache writes 1.25x.
+    if usage.get("cache_read_input_tokens"):
+        cost["cache_read_input_tokens"] = round(
+            (usage["cache_read_input_tokens"] / 1_000_000) * input_price * 0.1, 8)
+    if usage.get("cache_creation_input_tokens"):
+        cost["cache_creation_input_tokens"] = round(
+            (usage["cache_creation_input_tokens"] / 1_000_000) * input_price * 1.25, 8)
+    cost["total"] = round(sum(cost.values()), 8)
+    return cost
 
 
 def _extract_output(parsed):
@@ -775,6 +902,8 @@ def _parse_stream_buffer(full_bytes: bytes) -> tuple:
     usage_data = None
     anthropic_input_tokens  = None
     anthropic_output_tokens = None
+    anthropic_cache_read    = None
+    anthropic_cache_write   = None
     anthropic_text          = []
     for line in full_bytes.decode(errors="ignore").splitlines():
         line = line.strip()
@@ -803,6 +932,8 @@ def _parse_stream_buffer(full_bytes: bytes) -> tuple:
         if isinstance(message_obj, dict) and isinstance(message_obj.get("usage"), dict):
             anthropic_input_tokens = message_obj["usage"].get("input_tokens", anthropic_input_tokens)
             anthropic_output_tokens = message_obj["usage"].get("output_tokens", anthropic_output_tokens)
+            anthropic_cache_read  = message_obj["usage"].get("cache_read_input_tokens", anthropic_cache_read)
+            anthropic_cache_write = message_obj["usage"].get("cache_creation_input_tokens", anthropic_cache_write)
         if chunk_json.get("type") == "message_delta" and isinstance(chunk_json.get("usage"), dict):
             anthropic_output_tokens = chunk_json["usage"].get("output_tokens", anthropic_output_tokens)
         delta_obj = chunk_json.get("delta")
@@ -810,6 +941,10 @@ def _parse_stream_buffer(full_bytes: bytes) -> tuple:
             anthropic_text.append(delta_obj.get("text", ""))
     if anthropic_input_tokens is not None or anthropic_output_tokens is not None:
         usage_data = {"input_tokens": anthropic_input_tokens or 0, "output_tokens": anthropic_output_tokens or 0}
+        if anthropic_cache_read:
+            usage_data["cache_read_input_tokens"] = anthropic_cache_read
+        if anthropic_cache_write:
+            usage_data["cache_creation_input_tokens"] = anthropic_cache_write
     if anthropic_text:
         parsed = {"content": [{"type": "text", "text": "".join(anthropic_text)}]}
     return parsed, usage_data
@@ -949,11 +1084,18 @@ async def proxy(backend: str, rest: str, request: Request, background_tasks: Bac
                 raise
             finally:
                 ms     = int((time.time() - start_ms) * 1000)
-                full   = b"".join(collected)
-                parsed, usage_data = _parse_stream_buffer(full)
-                usage  = _parse_usage(usage_data)
-                cost   = _compute_cost(backend_cfg, model, usage)
-                output = _extract_output(parsed)
+                try:
+                    # Parsed inside the try: a malformed stream must not be
+                    # able to skip the .end() calls below and leave the
+                    # trace open (and so never exported).
+                    full   = b"".join(collected)
+                    parsed, usage_data = _parse_stream_buffer(full)
+                    usage  = _parse_usage(usage_data)
+                    cost   = _compute_cost(backend_cfg, model, usage)
+                    output = _extract_output(parsed)
+                except Exception as e:
+                    print(f"Langfuse error: could not parse stream for tracing: {e}", flush=True)
+                    output, usage, cost = None, None, None
                 try:
                     # Even when the connection errors out afterward, still
                     # attach whatever output/usage/cost was actually parsed
@@ -1024,19 +1166,23 @@ async def proxy(backend: str, rest: str, request: Request, background_tasks: Bac
                         metadata       = {"latency_ms": ms, "status_code": r.status_code},
                     )
                     root_span.update(output=output, level=level, metadata={"latency_ms": ms})
-                    _flush_langfuse_background(langfuse)
 
                     _log(request.method, f"{backend}/{rest}", r.status_code, ms, model, service)
-                    return Response(content=r.content, status_code=r.status_code,
-                                    headers=_resp_headers(r.headers))
+                    result = Response(content=r.content, status_code=r.status_code,
+                                      headers=_resp_headers(r.headers))
 
                 except Exception as e:
                     ms = int((time.time() - start_ms) * 1000)
                     gen_span.update(level="ERROR", status_message=str(e), metadata={"latency_ms": ms})
                     root_span.update(level="ERROR", metadata={"latency_ms": ms})
-                    _flush_langfuse_background(langfuse)
                     print(f"Proxy error: {e}", flush=True)
-                    return JSONResponse(status_code=502, content={"error": "proxy_error", "message": str(e)})
+                    result = JSONResponse(status_code=502, content={"error": "proxy_error", "message": str(e)})
+
+    # Flushed only now that both `with` blocks have exited and ended the
+    # spans -- flushing inside them exported everything except this
+    # request's own trace, which then waited for the SDK's next timed export.
+    _flush_langfuse_background(langfuse)
+    return result
 
 
 if __name__ == "__main__":
