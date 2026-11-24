@@ -113,6 +113,32 @@ Open `http://<this-host>:4000/admin` and paste in `ADMIN_TOKEN`. From there:
    the list; remove one to tighten what's allowed through. Applies instance-
    wide, immediately, no restart.
 
+### Google Gemini
+
+Two backend types, for two different Google APIs:
+
+| Type | Base URL | Use it for |
+|---|---|---|
+| `gemini` (OpenAI-compatible) | `https://generativelanguage.googleapis.com/v1beta/openai` | Text, JSON and image-*input* via `POST /<backend>/v1/chat/completions`. The proxy drops the `/v1` prefix Google's compat layer doesn't have. |
+| `gemini-native` | `https://generativelanguage.googleapis.com/v1beta` | Everything Google's compat layer can't do, notably **image generation** (e.g. `gemini-3-pro-image`, whose chat-completions route fails with `Unhandled generated data mime type`). |
+
+`gemini-native` is called like Google's own API, with the model in the URL:
+
+```bash
+curl -X POST https://<proxy>/<backend>/models/<model>:generateContent \
+  -H "Authorization: Bearer <team token>" -H "Content-Type: application/json" \
+  -d '{"contents": [{"parts": [{"text": "draw a red cube"}]}]}'
+```
+
+`:streamGenerateContent` (add `?alt=sse` for SSE) works too, and `v1beta/` may
+be left in the path, so Google's SDKs work with their base URL set to
+`https://<proxy>/<backend>` and the team token as the API key (the team token
+is accepted from `Authorization: Bearer` or `x-goog-api-key`; a `?key=` query
+parameter is never forwarded). The real Google key is sent upstream only, in
+`x-goog-api-key`. Tracing records the model, token usage (thinking tokens
+counted as output) and cost; generated/attached images are replaced by a
+`<N base64 chars omitted>` placeholder so traces stay small.
+
 No backends or teams ship pre-configured — `backends.yaml` only holds
 commented-out examples. The proxy is designed to start empty.
 

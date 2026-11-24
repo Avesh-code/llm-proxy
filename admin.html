@@ -385,6 +385,7 @@
                 <option value="ollama">Ollama</option>
                 <option value="anthropic">Anthropic</option>
                 <option value="gemini">Google Gemini</option>
+                <option value="gemini-native">Google Gemini (native — generateContent, images)</option>
               </select>
             </div>
           </div>
@@ -839,7 +840,9 @@ function curlBlock(name, t) {
     const b = backendsCache[bname];
     if (!b) return '';
     const model = (b.models && b.models[0] && b.models[0].id) || '<model>';
-    const cmd = `curl ${origin}/${bname}/v1/chat/completions \\\n  -H "Authorization: Bearer ${t.token}" -H "Content-Type: application/json" \\\n  -d '{"model": "${model}", "messages": [{"role": "user", "content": "hi"}]}'`;
+    const cmd = b.type === 'gemini-native'
+      ? `curl -X POST ${origin}/${bname}/models/${model}:generateContent \\\n  -H "Authorization: Bearer ${t.token}" -H "Content-Type: application/json" \\\n  -d '{"contents": [{"parts": [{"text": "hi"}]}]}'`
+      : `curl ${origin}/${bname}/v1/chat/completions \\\n  -H "Authorization: Bearer ${t.token}" -H "Content-Type: application/json" \\\n  -d '{"model": "${model}", "messages": [{"role": "user", "content": "hi"}]}'`;
     const id = `curl-${name}-${i}`;
     return `<div class="curl-wrap"><div class="curl" id="${id}">${esc(cmd)}</div>
       <button class="curl-copy small" title="Copy" onclick="copyText(document.getElementById('${id}').textContent, this)">

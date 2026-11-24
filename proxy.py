@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import json
 import time
@@ -24,6 +25,7 @@ except Exception:
 from contextlib import asynccontextmanager
 import threading
 import uvicorn
+from urllib.parse import urlencode
 
 # ── Config ────────────────────────────────────────────────────────────────────
 PROXY_PORT       = int(os.getenv("PROXY_PORT",       "4000"))
@@ -55,6 +57,13 @@ DEFAULT_LLM_ENDPOINTS = [
     "v1/rerank",           "rerank",
     "v1/messages",         "messages",
 ]
+
+# Google's native Gemini API (backend type "gemini-native"): the model is part
+# of the URL, not the body -- POST models/<model>:generateContent, or
+# :streamGenerateContent for streaming. A leading "v1beta/" is accepted too
+# so Google's own SDKs (which put it in the path) work unchanged when pointed
+# at /<backend>.
+GEMINI_NATIVE_PATH_RE = re.compile(r"^(?:v1beta/)?models/([^/:]+):(generateContent|streamGenerateContent)$")
 
 # Anthropic's API-format version, sent as the required `anthropic-version`
 # header on every request (not a model version -- it hasn't changed since
@@ -203,6 +212,9 @@ for _backend_name in BACKENDS:
 
 def _presented_token(request: Request) -> str:
     auth = request.headers.get("authorization", "")
+    if not auth:
+        # Google's SDKs send the key as x-goog-api-key, not Authorization.
+        return request.headers.get("x-goog-api-key", "").strip()
     return auth[7:].strip() if auth.lower().startswith("bearer ") else auth.strip()
 
 
@@ -549,15 +561,23 @@ async def whoami(request: Request):
         if not b:
             continue
         example_model = b["models"][0]["id"] if b["models"] else "<model>"
+        if b.get("type") == "gemini-native":
+            example_curl = (
+                f'curl -X POST {base}/{name}/models/{example_model}:generateContent '
+                f'-H "Authorization: Bearer {token}" -H "Content-Type: application/json" '
+                f'-d \'{{"contents": [{{"parts": [{{"text": "hi"}}]}}]}}\''
+            )
+        else:
+            example_curl = (
+                f'curl {base}/{name}/v1/chat/completions '
+                f'-H "Authorization: Bearer {token}" -H "Content-Type: application/json" '
+                f'-d \'{{"model": "{example_model}", "messages": [{{"role": "user", "content": "hi"}}]}}\''
+            )
         out.append({
             "backend":  name,
             "base_url": f"{base}/{name}",
             "models":   b["models"],
-            "example_curl": (
-                f'curl {base}/{name}/v1/chat/completions '
-                f'-H "Authorization: Bearer {token}" -H "Content-Type: application/json" '
-                f'-d \'{{"model": "{example_model}", "messages": [{{"role": "user", "content": "hi"}}]}}\''
-            ),
+            "example_curl": example_curl,
         })
     return {"team": team, "backends": out}
 
@@ -607,7 +627,7 @@ class ModelPriceIn(BaseModel):
 
 
 class BackendIn(BaseModel):
-    type: str = "openai"        # openai | vllm | ollama | anthropic | gemini | openai-compatible
+    type: str = "openai"        # openai | vllm | ollama | anthropic | gemini | gemini-native | openai-compatible
     base_url: str
     api_key: str = ""           # PUT with "" on an existing backend keeps the current key
     models: list[ModelPriceIn] = []
@@ -679,6 +699,8 @@ async def admin_test_backend(name: str, body: BackendIn):
         headers = {"anthropic-version": ANTHROPIC_VERSION}
         if api_key:
             headers["x-api-key"] = api_key
+    elif body.type == "gemini-native":
+        headers = {"x-goog-api-key": api_key} if api_key else {}
     else:
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     try:
@@ -686,6 +708,14 @@ async def admin_test_backend(name: str, body: BackendIn):
             r = await http_client.get(f"{base_url}/api/tags", headers=headers, timeout=10)
             r.raise_for_status()
             models = sorted(m["name"] for m in r.json().get("models", []))
+        elif body.type == "gemini-native":
+            r = await http_client.get(f"{base_url}/models", params={"pageSize": 1000}, headers=headers, timeout=10)
+            r.raise_for_status()
+            # {"models": [{"name": "models/gemini-...", "supportedGenerationMethods": [...]}]}
+            # -- the name is used bare in URLs (models/<name>:generateContent).
+            models = sorted(
+                m["name"].removeprefix("models/") for m in r.json().get("models", [])
+                if "generateContent" in m.get("supportedGenerationMethods", ["generateContent"]))
         else:
             # Gemini's OpenAI-compatible base URL already carries its version
             # (.../v1beta/openai), so its routes have no /v1 segment.
@@ -796,12 +826,17 @@ def _fwd_headers(h: dict, api_key: str, backend_type: str = "openai") -> dict:
     """
     out = dict(h)
     for k in ("host", "content-length", "transfer-encoding", "connection",
-              "authorization", "api-key", "x-api-key", "anthropic-version"):
+              "authorization", "api-key", "x-api-key", "anthropic-version", "x-goog-api-key"):
         out.pop(k, None)
     if backend_type == "anthropic":
         if api_key:
             out["x-api-key"] = api_key
         out["anthropic-version"] = ANTHROPIC_VERSION
+    elif backend_type == "gemini-native":
+        # Google's native API takes the key in x-goog-api-key; it does not
+        # accept a Bearer API key (that header is only for OAuth tokens).
+        if api_key:
+            out["x-goog-api-key"] = api_key
     elif api_key:
         out["authorization"] = f"Bearer {api_key}"
     return out
@@ -831,6 +866,9 @@ def _find_usage_dict(parsed: dict):
         return parsed["usage"]
     if "prompt_eval_count" in parsed or "eval_count" in parsed:
         return parsed
+    # Gemini native: token counts live under usageMetadata.
+    if isinstance(parsed.get("usageMetadata"), dict):
+        return parsed["usageMetadata"]
     return None
 
 
@@ -858,11 +896,13 @@ def _parse_usage(usage):
                 return usage[k]
         return 0
 
-    input_tok  = first("prompt_tokens", "input_tokens", "prompt_eval_count")
-    output_tok = first("completion_tokens", "output_tokens", "eval_count")
+    input_tok  = first("prompt_tokens", "input_tokens", "prompt_eval_count", "promptTokenCount")
+    output_tok = first("completion_tokens", "output_tokens", "eval_count", "candidatesTokenCount")
+    # Gemini bills "thinking" tokens as output but reports them separately.
+    output_tok += usage.get("thoughtsTokenCount") or 0
     cache_read  = usage.get("cache_read_input_tokens") or 0
     cache_write = usage.get("cache_creation_input_tokens") or 0
-    total_tok  = usage.get("total_tokens") or (input_tok + output_tok + cache_read + cache_write)
+    total_tok  = usage.get("total_tokens") or usage.get("totalTokenCount") or (input_tok + output_tok + cache_read + cache_write)
     out = {"input": input_tok, "output": output_tok, "total": total_tok}
     if cache_read:
         out["cache_read_input_tokens"] = cache_read
@@ -914,9 +954,34 @@ def _compute_cost(backend_cfg: dict, model: str, usage: dict):
     return cost
 
 
+def _redact_inline_data(o):
+    """
+    Gemini carries images/audio/files inline as base64 (inlineData). Left in a
+    trace, one generated image is megabytes of unreadable text -- keep the
+    mime type and size, drop the payload.
+    """
+    if isinstance(o, dict):
+        out = {}
+        for k, v in o.items():
+            if k in ("inlineData", "inline_data") and isinstance(v, dict):
+                data = v.get("data") or ""
+                out[k] = {**{kk: vv for kk, vv in v.items() if kk != "data"},
+                          "data": f"<{len(data)} base64 chars omitted>"}
+            else:
+                out[k] = _redact_inline_data(v)
+        return out
+    if isinstance(o, list):
+        return [_redact_inline_data(x) for x in o]
+    return o
+
+
 def _extract_output(parsed):
     if not isinstance(parsed, dict):
         return parsed
+    # Gemini native: the reply is candidates[0].content (role + parts).
+    candidates = parsed.get("candidates")
+    if isinstance(candidates, list) and candidates and isinstance(candidates[0], dict):
+        return _redact_inline_data(candidates[0].get("content") or candidates[0])
     choices = parsed.get("choices")
     if choices:
         return choices[0].get("message") or choices[0].get("delta") or parsed
@@ -980,15 +1045,37 @@ def _parse_stream_buffer(full_bytes: bytes) -> tuple:
     anthropic_cache_read    = None
     anthropic_cache_write   = None
     anthropic_text          = []
-    for line in full_bytes.decode(errors="ignore").splitlines():
-        line = line.strip()
-        if not line or "[DONE]" in line:
-            continue
-        chunk_str = line[len("data:"):].strip() if line.startswith("data:") else line
+    gemini_parts            = []
+    text   = full_bytes.decode(errors="ignore")
+    chunks = None
+    # Gemini's :streamGenerateContent without ?alt=sse streams one JSON array
+    # ([{...},\n{...}]) rather than SSE lines.
+    if text.lstrip().startswith("["):
         try:
-            chunk_json = json.loads(chunk_str)
+            chunks = [c for c in json.loads(text) if isinstance(c, dict)]
         except Exception:
-            continue
+            chunks = None
+    if chunks is None:
+        chunks = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or "[DONE]" in line:
+                continue
+            chunk_str = line[len("data:"):].strip() if line.startswith("data:") else line
+            try:
+                chunk_obj = json.loads(chunk_str)
+            except Exception:
+                continue
+            if isinstance(chunk_obj, dict):
+                chunks.append(chunk_obj)
+    for chunk_json in chunks:
+        # Gemini native: usageMetadata is cumulative (last chunk wins); the
+        # reply arrives as parts spread across chunks.
+        if isinstance(chunk_json.get("usageMetadata"), dict):
+            usage_data = chunk_json["usageMetadata"]
+        cands = chunk_json.get("candidates")
+        if isinstance(cands, list) and cands and isinstance(cands[0], dict):
+            gemini_parts.extend((cands[0].get("content") or {}).get("parts") or [])
         if chunk_json.get("usage"):
             usage_data = chunk_json["usage"]
         if chunk_json.get("choices"):
@@ -1022,6 +1109,15 @@ def _parse_stream_buffer(full_bytes: bytes) -> tuple:
             usage_data["cache_creation_input_tokens"] = anthropic_cache_write
     if anthropic_text:
         parsed = {"content": [{"type": "text", "text": "".join(anthropic_text)}]}
+    if gemini_parts:
+        merged = []
+        for part in gemini_parts:
+            plain = isinstance(part, dict) and set(part) == {"text"}
+            if plain and merged and set(merged[-1]) == {"text"}:
+                merged[-1] = {"text": merged[-1]["text"] + part["text"]}
+            else:
+                merged.append(part)
+        parsed = {"candidates": [{"content": {"role": "model", "parts": merged}}]}
     return parsed, usage_data
 
 
@@ -1063,7 +1159,17 @@ async def proxy(backend: str, rest: str, request: Request, background_tasks: Bac
     headers = _fwd_headers(dict(request.headers), backend_cfg["api_key"], backend_cfg.get("type", "openai"))
     body_b  = await request.body()
     rest_key = rest.lstrip("/")
-    is_llm   = rest_key in LLM_ENDPOINTS
+    # Gemini native generateContent / streamGenerateContent (model in the URL).
+    gemini_m = (GEMINI_NATIVE_PATH_RE.match(rest_key)
+                if backend_cfg.get("type") == "gemini-native" else None)
+    is_llm   = rest_key in LLM_ENDPOINTS or gemini_m is not None
+    if gemini_m:
+        url = f"{backend_cfg['base_url']}/{rest_key.removeprefix('v1beta/')}"
+        # Forward the query (alt=sse picks SSE streaming) but never a client-
+        # supplied ?key=: the backend's own key is attached via header.
+        qs = [(k, v) for k, v in request.query_params.multi_items() if k != "key"]
+        if qs:
+            url += "?" + urlencode(qs)
 
     body_j = {}
     if body_b and is_llm:
@@ -1087,18 +1193,30 @@ async def proxy(backend: str, rest: str, request: Request, background_tasks: Bac
         }})
 
     # ── LLM path ──────────────────────────────────────────────────────────────
-    model      = body_j.get("model", "unknown")
+    model      = gemini_m.group(1) if gemini_m else body_j.get("model", "unknown")
     # Chat Completions sends "messages"; the Responses API sends "input"
     # (a string or a list of role/content items) and no "messages" at all;
     # rerank sends neither — just "query" (+ "documents", left out of the
     # trace input to avoid bloating it with a full document list).
     messages   = body_j.get("messages") or body_j.get("input") or body_j.get("prompt") or body_j.get("query")
+    if gemini_m:
+        messages = _redact_inline_data(body_j.get("contents"))
+        if body_j.get("systemInstruction"):
+            messages = {"systemInstruction": body_j["systemInstruction"], "contents": messages}
+        gen_cfg = body_j.get("generationConfig") or {}
+        model_params = {"temperature": gen_cfg.get("temperature"),
+                        "max_tokens":  gen_cfg.get("maxOutputTokens"),
+                        "top_p":       gen_cfg.get("topP")}
+    else:
+        model_params = {"temperature": body_j.get("temperature"),
+                        "max_tokens":  body_j.get("max_tokens"),
+                        "top_p":       body_j.get("top_p")}
     trace_name = request.headers.get("x-trace-name") or model or "llm-request"
     user_id    = request.headers.get("x-user-id") or None
     # Derived from the validated token, so a client cannot spoof it.
     service    = team
     tags       = [t for t in [model, backend, service] if t]
-    is_stream  = body_j.get("stream", False)
+    is_stream  = (gemini_m.group(2) == "streamGenerateContent") if gemini_m else body_j.get("stream", False)
     start_ms   = time.time()
     # Each team traces into its own Langfuse project; a team with no keys
     # configured gets a no-op client, so nothing below needs to branch on it.
@@ -1139,11 +1257,7 @@ async def proxy(backend: str, rest: str, request: Request, background_tasks: Bac
                 name             = "chat-completion",
                 model            = model,
                 input            = messages,
-                model_parameters = {
-                    "temperature": body_j.get("temperature"),
-                    "max_tokens":  body_j.get("max_tokens"),
-                    "top_p":       body_j.get("top_p"),
-                },
+                model_parameters = model_params,
             )
 
         async def stream_gen():
@@ -1198,7 +1312,9 @@ async def proxy(backend: str, rest: str, request: Request, background_tasks: Bac
                     print(f"Langfuse error: {e}", flush=True)
                 _log(request.method, f"{backend}/{rest}", "stream", ms, model, service)
 
-        return StreamingResponse(stream_gen(), media_type="text/event-stream")
+        # Without ?alt=sse Gemini streams a JSON array, not SSE.
+        sse = not gemini_m or request.query_params.get("alt") == "sse"
+        return StreamingResponse(stream_gen(), media_type="text/event-stream" if sse else "application/json")
 
     # ── Non-streaming ──────────────────────────────────────────────────────────
     with propagate_attributes(user_id=user_id, tags=tags):
@@ -1213,11 +1329,7 @@ async def proxy(backend: str, rest: str, request: Request, background_tasks: Bac
                 name             = "chat-completion",
                 model            = model,
                 input            = messages,
-                model_parameters = {
-                    "temperature": body_j.get("temperature"),
-                    "max_tokens":  body_j.get("max_tokens"),
-                    "top_p":       body_j.get("top_p"),
-                },
+                model_parameters = model_params,
             ) as gen_span:
                 try:
                     async with _backend_semaphore(backend):
