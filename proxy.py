@@ -557,7 +557,7 @@ class ModelPriceIn(BaseModel):
 
 
 class BackendIn(BaseModel):
-    type: str = "openai"        # openai | vllm | ollama | openai-compatible
+    type: str = "openai"        # openai | vllm | ollama | gemini | openai-compatible
     base_url: str
     api_key: str = ""           # PUT with "" on an existing backend keeps the current key
     models: list[ModelPriceIn] = []
@@ -625,7 +625,10 @@ async def admin_test_backend(name: str, body: BackendIn):
             r.raise_for_status()
             models = sorted(m["name"] for m in r.json().get("models", []))
         else:
-            r = await http_client.get(f"{base_url}/v1/models", headers=headers, timeout=10)
+            # Gemini's OpenAI-compatible base URL already carries its version
+            # (.../v1beta/openai), so its routes have no /v1 segment.
+            models_path = "/models" if body.type == "gemini" else "/v1/models"
+            r = await http_client.get(f"{base_url}{models_path}", headers=headers, timeout=10)
             r.raise_for_status()
             # Most servers wrap the list as {"data": [...]}; some OpenAI-
             # compatible ones (e.g. Together AI) return the bare list.
@@ -908,6 +911,10 @@ async def proxy(backend: str, rest: str, request: Request, background_tasks: Bac
 
     backend_cfg = BACKENDS[backend]
     url     = f"{backend_cfg['base_url']}/{rest}"
+    if backend_cfg.get("type") == "gemini" and rest.lstrip("/").startswith("v1/"):
+        # Gemini's OpenAI-compatible base has no /v1 segment; clients still
+        # call /<backend>/v1/chat/completions, so drop it upstream.
+        url = f"{backend_cfg['base_url']}/{rest.lstrip('/')[3:]}"
     headers = _fwd_headers(dict(request.headers), backend_cfg["api_key"])
     body_b  = await request.body()
     rest_key = rest.lstrip("/")
