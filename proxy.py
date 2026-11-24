@@ -564,6 +564,8 @@ class BackendIn(BaseModel):
 
 
 class TeamIn(BaseModel):
+    given_to: str | None = None        # optional note: who this team's token was handed to. None keeps
+                                       # the stored value, "" clears it.
     token: str = ""                    # PUT with "" on an existing team keeps its current token;
     backends: list[str] = []           # on create, "" means "generate one server-side"
     langfuse_host: str = ""            # this team's own Langfuse project — blank host/public_key
@@ -668,7 +670,9 @@ async def admin_upsert_team(name: str, body: TeamIn):
         "public_key": body.langfuse_public_key,
         "secret_key": secret_key,
     }
-    store.data["teams"][name] = {"token": token, "backends": body.backends, "langfuse": langfuse_cfg}
+    given_to = (body.given_to if body.given_to is not None else existing.get("given_to", "")).strip()
+    store.data["teams"][name] = {"token": token, "backends": body.backends, "langfuse": langfuse_cfg,
+                                 "given_to": given_to}
     await store.save()
     _rebuild_indexes()
     _reinit_team_langfuse(name, replace=True)
