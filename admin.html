@@ -440,6 +440,8 @@
           <input type="hidden" id="tf-original-name">
           <label>Team name</label>
           <input type="text" id="tf-name" placeholder="e.g. team-search" required>
+          <label>Given to <span class="field-hint">optional — who this token was handed to, e.g. a person or app</span></label>
+          <input type="text" id="tf-given-to" placeholder="e.g. Rahul (drafting app)">
           <label>Token <span class="field-hint">leave blank to auto-generate</span></label>
           <div class="row">
             <input type="text" id="tf-token" placeholder="auto-generated on save">
@@ -762,7 +764,7 @@ function renderTeams() {
     const phx = t.phoenix || {};
     const tr = document.createElement('tr');
     tr.innerHTML = `
-      <td class="name-cell">${esc(name)}</td>
+      <td class="name-cell">${esc(name)}${t.given_to ? `<div style="color:var(--muted);font-size:12px;font-weight:400">${esc(t.given_to)}</div>` : ''}</td>
       <td><span class="mono" style="color:var(--muted)">${esc(shortToken(t.token))}</span>
         <button class="ghost" title="Copy token" onclick="copyText('${escAttr(t.token)}', this)">
           <svg class="icon" viewBox="0 0 24 24"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
@@ -832,6 +834,7 @@ function openTeamForm(name) {
     document.getElementById('tf-original-name').value = name;
     document.getElementById('tf-name').value = name;
     document.getElementById('tf-name').disabled = true;
+    document.getElementById('tf-given-to').value = t.given_to || '';
     document.getElementById('tf-token').value = t.token;
     document.getElementById('tf-token').placeholder = '';
     document.getElementById('tf-tracing-enabled').checked = phx.enabled !== false;
@@ -867,6 +870,7 @@ async function saveTeam(ev) {
     const res = await api(`/admin/api/teams/${encodeURIComponent(name)}`, {
       method: 'PUT',
       body: JSON.stringify({
+        given_to: document.getElementById('tf-given-to').value.trim(),
         token: document.getElementById('tf-token').value.trim(),
         backends,
         tracing_enabled: document.getElementById('tf-tracing-enabled').checked,

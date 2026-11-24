@@ -561,6 +561,8 @@ class BackendIn(BaseModel):
 
 
 class TeamIn(BaseModel):
+    given_to: str | None = None        # optional note: who this team's token was handed to. None keeps
+                                       # the stored value, "" clears it.
     token: str = ""                    # PUT with "" on an existing team keeps its current token;
     backends: list[str] = []           # on create, "" means "generate one server-side"
     tracing_enabled: bool = True       # off = this team's tracer is a no-op regardless of settings.phoenix
@@ -666,7 +668,9 @@ async def admin_upsert_team(name: str, body: TeamIn):
     existing = store.data["teams"].get(name, {})
     token    = body.token or existing.get("token") or secrets.token_hex(24)
     phoenix_cfg = {"enabled": body.tracing_enabled, "project_name": body.project_name}
-    store.data["teams"][name] = {"token": token, "backends": body.backends, "phoenix": phoenix_cfg}
+    given_to = (body.given_to if body.given_to is not None else existing.get("given_to", "")).strip()
+    store.data["teams"][name] = {"token": token, "backends": body.backends, "phoenix": phoenix_cfg,
+                                 "given_to": given_to}
     await store.save()
     _rebuild_indexes()
     _reinit_team_tracer(name)
